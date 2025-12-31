@@ -8,9 +8,15 @@ const COLLAPSED_WIDTH = 120
 const EXPANDED_WIDTH = 600
 const DEFAULT_MODEL = 'gemini-2.0-flash'
 
+type ChatMessage = {
+    role: 'user' | 'assistant'
+    text: string
+}
+
 const AssistantWidget: React.FC = () => {
     const [loading, setLoading] = useState(false)
     const [response, setResponse] = useState<string | null>(null)
+    const [messages, setMessages] = useState<ChatMessage[]>([])
     const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_api_key') || '')
     const [modelName, setModelName] = useState(localStorage.getItem('gemini_model') || DEFAULT_MODEL)
     const [showSettings, setShowSettings] = useState(!apiKey)
@@ -18,7 +24,10 @@ const AssistantWidget: React.FC = () => {
     const [isCollapsed, setIsCollapsed] = useState(false)
     const [needsScreenPermission, setNeedsScreenPermission] = useState(false)
     const [listingModels, setListingModels] = useState(false)
+    const [followUp, setFollowUp] = useState('')
+    const [followUpLoading, setFollowUpLoading] = useState(false)
     const apiKeyInputRef = useRef<HTMLInputElement | null>(null)
+    const chatSessionRef = useRef<any>(null)
 
 
     useEffect(() => {
@@ -35,16 +44,17 @@ const AssistantWidget: React.FC = () => {
         if (!ipc?.invoke) {
             return
         }
+        const hasContent = Boolean(response) || messages.length > 0
         const size = isCollapsed
             ? { width: COLLAPSED_WIDTH, height: COLLAPSED_HEIGHT }
             : {
                 width: EXPANDED_WIDTH,
-                height: response ? RESPONSE_HEIGHT : showSettings ? SETTINGS_HEIGHT : COLLAPSED_HEIGHT,
+                height: hasContent ? RESPONSE_HEIGHT : showSettings ? SETTINGS_HEIGHT : COLLAPSED_HEIGHT,
             }
         ipc.invoke('resize-window', size).catch((error: unknown) => {
             console.warn('[RENDERER] Window resize failed:', error)
         })
-    }, [response, showSettings, isCollapsed])
+    }, [response, messages.length, showSettings, isCollapsed])
 
     useEffect(() => {
         const ipc = (window as any).ipcRenderer
@@ -75,6 +85,9 @@ const AssistantWidget: React.FC = () => {
         setLoading(true)
         setResponse(null)
         setNeedsScreenPermission(false)
+        setMessages([])
+        setFollowUp('')
+        chatSessionRef.current = null
 
         try {
             console.log('[RENDERER] Invoking capture-screen...')
@@ -116,7 +129,24 @@ const AssistantWidget: React.FC = () => {
             } else {
                 // Strip markdown code blocks (e.g., ```typescript ... ```)
                 const cleanText = text.replace(/```[a-zA-Z]*\n?([\s\S]*?)```/g, '$1').trim()
-                setResponse(cleanText)
+                setMessages([{ role: 'assistant', text: cleanText }])
+                chatSessionRef.current = model.startChat({
+                    history: [
+                        {
+                            role: 'user',
+                            parts: [
+                                {
+                                    inlineData: {
+                                        data: base64Image,
+                                        mimeType: 'image/png',
+                                    },
+                                },
+                                { text: systemPrompt },
+                            ],
+                        },
+                        { role: 'model', parts: [{ text: cleanText }] },
+                    ],
+                })
             }
         } catch (error) {
             console.error('[RENDERER] Error in handleCapture:', error)
@@ -126,13 +156,16 @@ const AssistantWidget: React.FC = () => {
                 setNeedsScreenPermission(true)
                 setResponse('Screen capture is blocked. Grant Screen Recording permission in System Settings and try again.')
             } else if (/not found|not supported|404|model/i.test(message)) {
+                setNeedsScreenPermission(false)
                 setResponse(
                     `API Error: The model "${modelName}" was not found.\n\nTry these IDs in settings:\n1. gemini-2.0-flash\n2. gemini-1.5-flash\n3. gemini-2.0-flash-exp\n\nOr click "List Available Models" in settings to check your key.`,
                 )
             } else {
+                setNeedsScreenPermission(false)
                 setResponse(`Error: ${message}`)
             }
-            setNeedsScreenPermission(false)
+            setMessages([])
+            chatSessionRef.current = null
         } finally {
             console.log('[RENDERER] Analysis session finished.')
             setLoading(false)
@@ -140,10 +173,39 @@ const AssistantWidget: React.FC = () => {
     }
 
     const copyToClipboard = () => {
-        if (response) {
-            navigator.clipboard.writeText(response)
-            setCopied(true)
-            setTimeout(() => setCopied(false), 2000)
+        const lastAssistant = [...messages].reverse().find((msg) => msg.role === 'assistant')?.text
+        const textToCopy = lastAssistant || response
+        if (!textToCopy) return
+        navigator.clipboard.writeText(textToCopy)
+        setCopied(true)
+        setTimeout(() => setCopied(false), 2000)
+    }
+
+    const sendFollowUp = async () => {
+        const trimmed = followUp.trim()
+        if (!trimmed || followUpLoading) return
+        if (!chatSessionRef.current) {
+            setResponse('No active context. Run Quick Solve first.')
+            return
+        }
+
+        setFollowUpLoading(true)
+        setMessages((prev) => [...prev, { role: 'user', text: trimmed }])
+        setFollowUp('')
+
+        try {
+            const result = await chatSessionRef.current.sendMessage(trimmed)
+            const text = result.response.text()
+            const cleanText = text.replace(/```[a-zA-Z]*\n?([\s\S]*?)```/g, '$1').trim()
+            setMessages((prev) => [...prev, { role: 'assistant', text: cleanText }])
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            setMessages((prev) => [
+                ...prev,
+                { role: 'assistant', text: `Error: ${message}` },
+            ])
+        } finally {
+            setFollowUpLoading(false)
         }
     }
 
@@ -158,13 +220,16 @@ const AssistantWidget: React.FC = () => {
             if (data.models) {
                 const modelIds = data.models.map((m: any) => m.name.replace('models/', ''))
                 console.log('[RENDERER] Available Models:', modelIds)
+                setMessages([])
                 setResponse(`Available Models (Check Console for details):\n\n${modelIds.slice(0, 10).join('\n')}${modelIds.length > 10 ? '\n...' : ''}`)
             } else {
                 console.warn('[RENDERER] No models list in response:', data)
+                setMessages([])
                 setResponse(`API responded but no models were found. Full response in console.`)
             }
         } catch (error) {
             console.error('[RENDERER] List models failed:', error)
+            setMessages([])
             setResponse(`Failed to list models: ${error instanceof Error ? error.message : String(error)}`)
         } finally {
             setListingModels(false)
@@ -178,6 +243,8 @@ const AssistantWidget: React.FC = () => {
         localStorage.setItem('gemini_model', nextModel)
         setModelName(nextModel)
         setShowSettings(false)
+        setMessages([])
+        chatSessionRef.current = null
         console.log('[RENDERER] Settings updated.')
     }
 
@@ -205,7 +272,7 @@ const AssistantWidget: React.FC = () => {
             ) : (
                 <>
                     {/* Response Card */}
-                    {response && (
+                    {(response || messages.length > 0) && (
                         <div className="glass no-drag w-[500px] p-4 rounded-2xl animate-in fade-in slide-in-from-bottom-4 duration-300 overflow-auto max-h-[300px]">
                             <div className="flex justify-between items-start mb-2">
                                 <span className="text-xs font-bold text-white/50 uppercase tracking-widest">Solution</span>
@@ -213,7 +280,9 @@ const AssistantWidget: React.FC = () => {
                                     <button
                                         onClick={() => {
                                             setResponse(null)
+                                            setMessages([])
                                             setNeedsScreenPermission(false)
+                                            chatSessionRef.current = null
                                         }}
                                         className="no-drag text-xs text-white/40 hover:text-white/80 transition-colors"
                                     >
@@ -227,9 +296,22 @@ const AssistantWidget: React.FC = () => {
                                     </button>
                                 </div>
                             </div>
-                            <pre className="text-sm text-blue-100 whitespace-pre-wrap font-mono leading-relaxed">
-                                {response}
-                            </pre>
+                            {messages.length > 0 ? (
+                                <div className="space-y-3 text-sm text-blue-100 whitespace-pre-wrap font-mono leading-relaxed">
+                                    {messages.map((msg, index) => (
+                                        <div key={`${msg.role}-${index}`}>
+                                            <span className="block text-[10px] uppercase tracking-widest text-white/40 mb-1">
+                                                {msg.role === 'user' ? 'You' : 'Assistant'}
+                                            </span>
+                                            <div>{msg.text}</div>
+                                        </div>
+                                    ))}
+                                </div>
+                            ) : (
+                                <pre className="text-sm text-blue-100 whitespace-pre-wrap font-mono leading-relaxed">
+                                    {response}
+                                </pre>
+                            )}
                             {needsScreenPermission && (
                                 <button
                                     onClick={openScreenRecordingSettings}
@@ -237,6 +319,34 @@ const AssistantWidget: React.FC = () => {
                                 >
                                     Open Screen Recording Settings
                                 </button>
+                            )}
+                            {messages.length > 0 && (
+                                <div className="no-drag mt-4 border-t border-white/10 pt-3">
+                                    <label className="block text-[10px] text-white/40 uppercase font-black mb-2">Follow-up</label>
+                                    <div className="flex gap-2">
+                                        <input
+                                            type="text"
+                                            value={followUp}
+                                            onChange={(e) => setFollowUp(e.target.value)}
+                                            onKeyDown={(e) => {
+                                                if (e.key === 'Enter' && !e.shiftKey) {
+                                                    e.preventDefault()
+                                                    sendFollowUp()
+                                                }
+                                            }}
+                                            placeholder="Ask a follow-up..."
+                                            className="no-drag bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs text-white w-full outline-none focus:border-blue-500/50"
+                                        />
+                                        <button
+                                            type="button"
+                                            onClick={sendFollowUp}
+                                            disabled={followUpLoading || !followUp.trim()}
+                                            className="no-drag bg-blue-600/20 hover:bg-blue-600/40 disabled:opacity-50 text-blue-200 px-3 py-2 rounded-xl text-xs font-bold transition-colors"
+                                        >
+                                            {followUpLoading ? '...' : 'Send'}
+                                        </button>
+                                    </div>
+                                </div>
                             )}
                         </div>
                     )}
