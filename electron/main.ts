@@ -170,6 +170,8 @@ function createWindow() {
     if (process.platform === 'darwin') {
         win.setWindowButtonVisibility(false)
         win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+        // Make the window invisible to screen capture and recording
+        win.setContentProtection(true)
     }
 
     if (process.env.VITE_DEV_SERVER_URL) {
