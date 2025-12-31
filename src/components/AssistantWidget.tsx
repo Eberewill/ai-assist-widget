@@ -13,6 +13,42 @@ type ChatMessage = {
     text: string
 }
 
+type MessagePart = {
+    type: 'text' | 'code'
+    content: string
+    language?: string
+}
+
+function splitMessageParts(text: string): MessagePart[] {
+    const parts: MessagePart[] = []
+    const regex = /```(\w+)?\n?([\s\S]*?)```/g
+    let lastIndex = 0
+    let match: RegExpExecArray | null
+
+    while ((match = regex.exec(text)) !== null) {
+        if (match.index > lastIndex) {
+            const chunk = text.slice(lastIndex, match.index).trim()
+            if (chunk) {
+                parts.push({ type: 'text', content: chunk })
+            }
+        }
+        const code = match[2]?.replace(/\s+$/, '')
+        if (code) {
+            parts.push({ type: 'code', content: code, language: match[1] })
+        }
+        lastIndex = regex.lastIndex
+    }
+
+    if (lastIndex < text.length) {
+        const chunk = text.slice(lastIndex).trim()
+        if (chunk) {
+            parts.push({ type: 'text', content: chunk })
+        }
+    }
+
+    return parts.length ? parts : [{ type: 'text', content: text }]
+}
+
 const AssistantWidget: React.FC = () => {
     const [loading, setLoading] = useState(false)
     const [response, setResponse] = useState<string | null>(null)
@@ -26,6 +62,7 @@ const AssistantWidget: React.FC = () => {
     const [listingModels, setListingModels] = useState(false)
     const [followUp, setFollowUp] = useState('')
     const [followUpLoading, setFollowUpLoading] = useState(false)
+    const [copiedCodeId, setCopiedCodeId] = useState<string | null>(null)
     const apiKeyInputRef = useRef<HTMLInputElement | null>(null)
     const chatSessionRef = useRef<any>(null)
 
@@ -128,7 +165,7 @@ const AssistantWidget: React.FC = () => {
                 setResponse('Gemini didn\'t find anything to solve on the screen. Make sure the problem is clearly visible.')
             } else {
                 // Strip markdown code blocks (e.g., ```typescript ... ```)
-                const cleanText = text.replace(/```[a-zA-Z]*\n?([\s\S]*?)```/g, '$1').trim()
+                const cleanText = text.trim()
                 setMessages([{ role: 'assistant', text: cleanText }])
                 chatSessionRef.current = model.startChat({
                     history: [
@@ -196,7 +233,7 @@ const AssistantWidget: React.FC = () => {
         try {
             const result = await chatSessionRef.current.sendMessage(trimmed)
             const text = result.response.text()
-            const cleanText = text.replace(/```[a-zA-Z]*\n?([\s\S]*?)```/g, '$1').trim()
+            const cleanText = text.trim()
             setMessages((prev) => [...prev, { role: 'assistant', text: cleanText }])
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
@@ -207,6 +244,45 @@ const AssistantWidget: React.FC = () => {
         } finally {
             setFollowUpLoading(false)
         }
+    }
+
+    const copyCodeBlock = (code: string, id: string) => {
+        navigator.clipboard.writeText(code)
+        setCopiedCodeId(id)
+        setTimeout(() => setCopiedCodeId(null), 2000)
+    }
+
+    const renderMessageContent = (text: string, keyPrefix: string) => {
+        const parts = splitMessageParts(text)
+        return parts.map((part, index) => {
+            const partKey = `${keyPrefix}-${index}`
+            if (part.type === 'code') {
+                return (
+                    <div key={partKey} className="mt-2 rounded-xl border border-white/10 bg-black/60 p-3">
+                        <div className="flex items-center justify-between mb-2">
+                            <span className="text-[10px] uppercase tracking-widest text-white/50">
+                                {part.language ? part.language : 'code'}
+                            </span>
+                            <button
+                                onClick={() => copyCodeBlock(part.content, partKey)}
+                                className="no-drag text-[10px] px-2 py-1 rounded bg-white/10 hover:bg-white/20 text-white/80 transition-colors"
+                            >
+                                {copiedCodeId === partKey ? 'Copied' : 'Copy'}
+                            </button>
+                        </div>
+                        <pre className="text-xs text-emerald-200 whitespace-pre-wrap font-mono leading-relaxed">
+                            {part.content}
+                        </pre>
+                    </div>
+                )
+            }
+
+            return (
+                <div key={partKey} className="text-sm text-white whitespace-pre-wrap leading-relaxed">
+                    {part.content}
+                </div>
+            )
+        })
     }
 
     const listModels = async () => {
@@ -259,7 +335,7 @@ const AssistantWidget: React.FC = () => {
     }
 
     return (
-        <div className="flex flex-col items-center gap-3" aria-hidden="true">
+        <div className="widget-layer flex flex-col items-center gap-3" aria-hidden="true">
             {isCollapsed ? (
                 <div className="glass drag flex items-center justify-center px-2 py-2 rounded-full shadow-lg cursor-move">
                     <button
@@ -275,7 +351,7 @@ const AssistantWidget: React.FC = () => {
                     {(response || messages.length > 0) && (
                         <div className="glass no-drag w-[500px] p-4 rounded-2xl animate-in fade-in slide-in-from-bottom-4 duration-300 overflow-auto max-h-[300px]">
                             <div className="flex justify-between items-start mb-2">
-                                <span className="text-xs font-bold text-white/50 uppercase tracking-widest">Solution</span>
+                                <span className="text-xs font-bold text-white uppercase tracking-widest">Solution</span>
                                 <div className="flex gap-2">
                                     <button
                                         onClick={() => {
@@ -297,20 +373,31 @@ const AssistantWidget: React.FC = () => {
                                 </div>
                             </div>
                             {messages.length > 0 ? (
-                                <div className="space-y-3 text-sm text-blue-100 whitespace-pre-wrap font-mono leading-relaxed">
+                                <div className="space-y-3">
                                     {messages.map((msg, index) => (
-                                        <div key={`${msg.role}-${index}`}>
-                                            <span className="block text-[10px] uppercase tracking-widest text-white/40 mb-1">
-                                                {msg.role === 'user' ? 'You' : 'Assistant'}
-                                            </span>
-                                            <div>{msg.text}</div>
+                                        <div
+                                            key={`${msg.role}-${index}`}
+                                            className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                                        >
+                                            <div
+                                                className={`max-w-[420px] rounded-2xl px-3 py-2 border ${
+                                                    msg.role === 'user'
+                                                        ? 'bg-blue-600/30 border-blue-400/30 text-white'
+                                                        : 'bg-white/5 border-white/10 text-white'
+                                                }`}
+                                            >
+                                                <span className="block text-[10px] uppercase tracking-widest text-white/50 mb-1">
+                                                    {msg.role === 'user' ? 'You' : 'Assistant'}
+                                                </span>
+                                                {renderMessageContent(msg.text, `${msg.role}-${index}`)}
+                                            </div>
                                         </div>
                                     ))}
                                 </div>
                             ) : (
-                                <pre className="text-sm text-blue-100 whitespace-pre-wrap font-mono leading-relaxed">
-                                    {response}
-                                </pre>
+                                <div className="text-white">
+                                    {response ? renderMessageContent(response, 'response') : null}
+                                </div>
                             )}
                             {needsScreenPermission && (
                                 <button
@@ -324,8 +411,7 @@ const AssistantWidget: React.FC = () => {
                                 <div className="no-drag mt-4 border-t border-white/10 pt-3">
                                     <label className="block text-[10px] text-white/40 uppercase font-black mb-2">Follow-up</label>
                                     <div className="flex gap-2">
-                                        <input
-                                            type="text"
+                                        <textarea
                                             value={followUp}
                                             onChange={(e) => setFollowUp(e.target.value)}
                                             onKeyDown={(e) => {
@@ -335,7 +421,8 @@ const AssistantWidget: React.FC = () => {
                                                 }
                                             }}
                                             placeholder="Ask a follow-up..."
-                                            className="no-drag bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs text-white w-full outline-none focus:border-blue-500/50"
+                                            rows={2}
+                                            className="no-drag bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs text-white w-full outline-none focus:border-blue-500/50 resize-none"
                                         />
                                         <button
                                             type="button"
@@ -391,53 +478,76 @@ const AssistantWidget: React.FC = () => {
                     {/* Settings Modal */}
                     {showSettings && (
                         <div className="glass no-drag mt-4 p-5 rounded-2xl w-80 animate-in fade-in zoom-in-95 duration-200">
-                            <form onSubmit={saveSettings}>
-                                <label className="block text-[10px] text-white/40 uppercase font-black mb-3">Gemini API Key</label>
-                                <div className="flex gap-2">
-                                    <input
-                                        type="password"
-                                        value={apiKey}
-                                        onChange={(e) => setApiKey(e.target.value)}
-                                        placeholder="Paste API key..."
-                                        ref={apiKeyInputRef}
-                                        className="no-drag bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-sm text-white w-full outline-none focus:border-blue-500/50"
-                                    />
+                            <form onSubmit={saveSettings} className="space-y-4">
+                                <div className="flex items-center justify-between">
+                                    <div>
+                                        <h3 className="text-sm font-semibold text-white">Settings</h3>
+                                        <p className="text-[10px] text-white/40">Configure your Gemini access.</p>
+                                    </div>
                                     <button
-                                        type="submit"
-                                        className="no-drag bg-blue-600/20 hover:bg-blue-600/40 text-blue-400 px-3 py-2 rounded-xl text-xs font-bold transition-colors"
+                                        type="button"
+                                        onClick={() => setShowSettings(false)}
+                                        className="no-drag text-white/40 hover:text-white/80 transition-colors text-xs"
                                     >
-                                        Save
+                                        Close
                                     </button>
                                 </div>
-                                <label className="block text-[10px] text-white/40 uppercase font-black mt-4 mb-3">Gemini Model</label>
-                                <input
-                                    type="text"
-                                    value={modelName}
-                                    onChange={(e) => setModelName(e.target.value)}
-                                    placeholder={DEFAULT_MODEL}
-                                    className="no-drag bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-sm text-white w-full outline-none focus:border-blue-500/50"
-                                />
-                                <div className="flex flex-wrap gap-1 mt-2">
-                                    {['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.0-flash-exp'].map((m) => (
+
+                                <div className="space-y-2">
+                                    <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Gemini API Key</label>
+                                    <div className="flex gap-2">
+                                        <input
+                                            type="password"
+                                            value={apiKey}
+                                            onChange={(e) => setApiKey(e.target.value)}
+                                            placeholder="Paste API key..."
+                                            ref={apiKeyInputRef}
+                                            className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-sm text-white w-full outline-none focus:border-blue-500/50"
+                                        />
                                         <button
-                                            key={m}
-                                            type="button"
-                                            onClick={() => setModelName(m)}
-                                            className="text-[9px] bg-white/5 hover:bg-white/10 text-white/40 hover:text-white px-2 py-1 rounded transition-colors"
+                                            type="submit"
+                                            className="no-drag bg-blue-600/30 hover:bg-blue-600/50 text-blue-200 px-3 py-2 rounded-xl text-xs font-bold transition-colors"
                                         >
-                                            {m}
+                                            Save
                                         </button>
-                                    ))}
+                                    </div>
                                 </div>
+
+                                <div className="space-y-2">
+                                    <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Gemini Model</label>
+                                    <input
+                                        type="text"
+                                        value={modelName}
+                                        onChange={(e) => setModelName(e.target.value)}
+                                        placeholder={DEFAULT_MODEL}
+                                        className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-sm text-white w-full outline-none focus:border-blue-500/50"
+                                    />
+                                    <div className="flex flex-wrap gap-1">
+                                        {['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.0-flash-exp'].map((m) => (
+                                            <button
+                                                key={m}
+                                                type="button"
+                                                onClick={() => setModelName(m)}
+                                                className="text-[9px] bg-white/5 hover:bg-white/10 text-white/50 hover:text-white px-2 py-1 rounded-full transition-colors"
+                                            >
+                                                {m}
+                                            </button>
+                                        ))}
+                                    </div>
+                                </div>
+
                                 <button
                                     type="button"
                                     onClick={listModels}
                                     disabled={listingModels}
-                                    className="no-drag mt-4 w-full bg-white/5 hover:bg-white/10 disabled:opacity-50 text-white/60 py-2 rounded-xl text-[10px] font-bold uppercase tracking-wider transition-all"
+                                    className="no-drag w-full bg-white/5 hover:bg-white/10 disabled:opacity-50 text-white/70 py-2 rounded-xl text-[10px] font-bold uppercase tracking-wider transition-all"
                                 >
                                     {listingModels ? 'Listing...' : 'List Available Models'}
                                 </button>
-                                <p className="text-[10px] text-white/20 mt-3 italic text-center">API key is saved locally in your browser storage.</p>
+
+                                <p className="text-[10px] text-white/20 italic text-center">
+                                    API key is saved locally in your browser storage.
+                                </p>
                             </form>
                         </div>
                     )}
