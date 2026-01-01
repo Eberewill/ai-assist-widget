@@ -77,6 +77,7 @@ const AssistantWidget: React.FC = () => {
     const [copiedCodeId, setCopiedCodeId] = useState<string | null>(null)
     const [isRecording, setIsRecording] = useState(false)
     const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+    const [recommendations, setRecommendations] = useState<string[]>([])
     const apiKeyInputRef = useRef<HTMLInputElement | null>(null)
     const followUpImageInputRef = useRef<HTMLInputElement | null>(null)
     const chatSessionRef = useRef<any>(null)
@@ -123,7 +124,8 @@ const AssistantWidget: React.FC = () => {
                 const genAI = new GoogleGenerativeAI(apiKey)
                 const model = genAI.getGenerativeModel({ model: modelName || DEFAULT_MODEL })
 
-                const prompt = "Transcribe the audio and provide a concise answer if it's a question. If it's a statement, summarize it."
+                const prompt = `Transcribe the audio and provide a concise answer. 
+Also, provide 3 short logical follow-up actions (max 6 words each) at the end, each on a new line starting with 'Suggestion: '.`
 
                 const result = await model.generateContent([
                     {
@@ -135,8 +137,18 @@ const AssistantWidget: React.FC = () => {
                     prompt
                 ])
 
-                const text = result.response.text().trim()
-                setMessages([{ role: 'assistant', text }])
+                const fullText = result.response.text().trim()
+                const lines = fullText.split('\n')
+                const suggestions = lines
+                    .filter(l => l.startsWith('Suggestion:'))
+                    .map(l => l.replace('Suggestion:', '').trim())
+                const cleanText = lines
+                    .filter(l => !l.startsWith('Suggestion:'))
+                    .join('\n')
+                    .trim()
+
+                setMessages([{ role: 'assistant', text: cleanText }])
+                setRecommendations(suggestions)
 
                 chatSessionRef.current = model.startChat({
                     history: [
@@ -152,7 +164,7 @@ const AssistantWidget: React.FC = () => {
                                 { text: prompt },
                             ],
                         },
-                        { role: 'model', parts: [{ text }] },
+                        { role: 'model', parts: [{ text: fullText }] },
                     ],
                 })
             }
@@ -580,6 +592,29 @@ const AssistantWidget: React.FC = () => {
                             {messages.length > 0 && (
                                 <div className="no-drag mt-4 border-t border-white/10 pt-3">
                                     <label className="block text-[10px] text-white/40 uppercase font-black mb-2">Follow-up</label>
+
+                                    {recommendations.length > 0 && (
+                                        <div className="flex flex-wrap gap-2 mb-3 animate-in fade-in slide-in-from-bottom-2 duration-500">
+                                            {recommendations.map((rec, i) => (
+                                                <button
+                                                    key={i}
+                                                    onClick={() => {
+                                                        setFollowUp(rec)
+                                                        setRecommendations([])
+                                                        // Using a small delay to ensure state update for 'followUp' is reflected before send
+                                                        setTimeout(() => {
+                                                            const sendBtn = document.getElementById('send-followup-btn');
+                                                            sendBtn?.click();
+                                                        }, 50)
+                                                    }}
+                                                    className="no-drag text-[9px] px-3 py-1.5 rounded-full bg-blue-600/10 border border-blue-500/20 text-blue-200 hover:bg-blue-600/20 transition-all hover:scale-105 active:scale-95 whitespace-nowrap font-bold uppercase tracking-tight"
+                                                >
+                                                    {rec}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    )}
+
                                     <div className="flex gap-2 items-start">
                                         <textarea
                                             value={followUp}
@@ -604,6 +639,7 @@ const AssistantWidget: React.FC = () => {
                                                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2" /><circle cx="9" cy="9" r="2" /><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" /></svg>
                                             </button>
                                             <button
+                                                id="send-followup-btn"
                                                 type="button"
                                                 onClick={sendFollowUp}
                                                 disabled={followUpLoading || (!followUp.trim() && !followUpImage)}
