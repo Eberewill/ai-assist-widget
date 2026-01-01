@@ -75,9 +75,94 @@ const AssistantWidget: React.FC = () => {
     const [followUpImage, setFollowUpImage] = useState<FollowUpImage | null>(null)
     const [followUpLoading, setFollowUpLoading] = useState(false)
     const [copiedCodeId, setCopiedCodeId] = useState<string | null>(null)
+    const [isRecording, setIsRecording] = useState(false)
+    const mediaRecorderRef = useRef<MediaRecorder | null>(null)
     const apiKeyInputRef = useRef<HTMLInputElement | null>(null)
     const followUpImageInputRef = useRef<HTMLInputElement | null>(null)
     const chatSessionRef = useRef<any>(null)
+
+    const toggleRecording = async () => {
+        if (isRecording) {
+            mediaRecorderRef.current?.stop()
+            setIsRecording(false)
+            return
+        }
+
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+            const recorder = new MediaRecorder(stream)
+            const chunks: Blob[] = []
+
+            recorder.ondataavailable = (e) => {
+                if (e.data.size > 0) chunks.push(e.data)
+            }
+
+            recorder.onstop = async () => {
+                const audioBlob = new Blob(chunks, { type: 'audio/webm' })
+                await processAudio(audioBlob)
+                stream.getTracks().forEach(track => track.stop())
+            }
+
+            mediaRecorderRef.current = recorder
+            recorder.start()
+            setIsRecording(true)
+        } catch (error) {
+            console.error('[RENDERER] Mic access failed:', error)
+            setResponse('Microphone access denied or not found.')
+        }
+    }
+
+    const processAudio = async (blob: Blob) => {
+        setLoading(true)
+        try {
+            const reader = new FileReader()
+            reader.readAsDataURL(blob)
+            reader.onloadend = async () => {
+                const base64Audio = (reader.result as string).split(',')[1]
+
+                const genAI = new GoogleGenerativeAI(apiKey)
+                const model = genAI.getGenerativeModel({ model: modelName || DEFAULT_MODEL })
+
+                const prompt = "Transcribe the audio and provide a concise answer if it's a question. If it's a statement, summarize it."
+
+                const result = await model.generateContent([
+                    {
+                        inlineData: {
+                            data: base64Audio,
+                            mimeType: "audio/webm"
+                        }
+                    },
+                    prompt
+                ])
+
+                const text = result.response.text().trim()
+                setMessages([{ role: 'assistant', text }])
+
+                chatSessionRef.current = model.startChat({
+                    history: [
+                        {
+                            role: 'user',
+                            parts: [
+                                {
+                                    inlineData: {
+                                        data: base64Audio,
+                                        mimeType: 'audio/webm',
+                                    },
+                                },
+                                { text: prompt },
+                            ],
+                        },
+                        { role: 'model', parts: [{ text }] },
+                    ],
+                })
+            }
+        } catch (error) {
+            console.error('[RENDERER] Audio processing failed:', error)
+            setResponse(`Audio Error: ${error instanceof Error ? error.message : String(error)}`)
+        } finally {
+            setLoading(false)
+        }
+    }
 
 
     useEffect(() => {
@@ -452,11 +537,10 @@ const AssistantWidget: React.FC = () => {
                                             className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
                                         >
                                             <div
-                                                className={`max-w-[420px] rounded-2xl px-3 py-2 border ${
-                                                    msg.role === 'user'
-                                                        ? 'bg-blue-600/30 border-blue-400/30 text-white'
-                                                        : 'bg-white/5 border-white/10 text-white'
-                                                }`}
+                                                className={`max-w-[420px] rounded-2xl px-3 py-2 border ${msg.role === 'user'
+                                                    ? 'bg-blue-600/30 border-blue-400/30 text-white'
+                                                    : 'bg-white/5 border-white/10 text-white'
+                                                    }`}
                                             >
                                                 <span className="block text-[10px] uppercase tracking-widest text-white/50 mb-1">
                                                     {msg.role === 'user' ? 'You' : 'Assistant'}
@@ -514,17 +598,23 @@ const AssistantWidget: React.FC = () => {
                                             <button
                                                 type="button"
                                                 onClick={() => followUpImageInputRef.current?.click()}
-                                                className="no-drag bg-white/10 hover:bg-white/20 text-white/80 px-3 py-2 rounded-xl text-[10px] font-bold transition-colors"
+                                                className="no-drag bg-white/10 hover:bg-white/20 text-white/80 p-2 rounded-xl transition-all hover:scale-105 active:scale-95"
+                                                title="Add Image"
                                             >
-                                                Add Image
+                                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2" /><circle cx="9" cy="9" r="2" /><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" /></svg>
                                             </button>
                                             <button
                                                 type="button"
                                                 onClick={sendFollowUp}
                                                 disabled={followUpLoading || (!followUp.trim() && !followUpImage)}
-                                                className="no-drag bg-blue-600/20 hover:bg-blue-600/40 disabled:opacity-50 text-blue-200 px-3 py-2 rounded-xl text-xs font-bold transition-colors"
+                                                className="no-drag bg-blue-600/20 hover:bg-blue-600/40 disabled:opacity-50 text-blue-200 p-2 rounded-xl transition-all hover:scale-105 active:scale-95"
+                                                title="Send"
                                             >
-                                                {followUpLoading ? '...' : 'Send'}
+                                                {followUpLoading ? (
+                                                    <div className="w-4 h-4 border-2 border-blue-200/30 border-t-blue-200 rounded-full animate-spin" />
+                                                ) : (
+                                                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m22 2-7 20-4-9-9-4Z" /><path d="M22 2 11 13" /></svg>
+                                                )}
                                             </button>
                                         </div>
                                     </div>
@@ -575,10 +665,22 @@ const AssistantWidget: React.FC = () => {
 
                         <button
                             onClick={handleCapture}
-                            disabled={loading}
+                            disabled={loading || isRecording}
                             className="no-drag bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 text-white px-5 py-2 rounded-full text-xs font-bold transition-all shadow-lg shadow-blue-500/20 active:translate-y-0.5"
                         >
                             {loading ? 'Working...' : 'Quick Solve'}
+                        </button>
+
+                        <button
+                            onClick={toggleRecording}
+                            disabled={loading}
+                            className={`no-drag px-5 py-2 rounded-full text-xs font-bold transition-all flex items-center gap-2 ${isRecording
+                                ? 'bg-red-600 text-white animate-pulse'
+                                : 'bg-white/10 hover:bg-white/20 text-white/90'
+                                }`}
+                        >
+                            <div className={`w-2 h-2 rounded-full ${isRecording ? 'bg-white' : 'bg-red-500'}`} />
+                            {isRecording ? 'Stop' : 'Record'}
                         </button>
 
                         <button
