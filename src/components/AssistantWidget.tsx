@@ -11,6 +11,17 @@ const DEFAULT_MODEL = 'gemini-2.0-flash'
 type ChatMessage = {
     role: 'user' | 'assistant'
     text: string
+    image?: {
+        dataUrl: string
+        name?: string
+    }
+}
+
+type FollowUpImage = {
+    dataUrl: string
+    base64: string
+    mimeType: string
+    name?: string
 }
 
 type MessagePart = {
@@ -61,9 +72,11 @@ const AssistantWidget: React.FC = () => {
     const [needsScreenPermission, setNeedsScreenPermission] = useState(false)
     const [listingModels, setListingModels] = useState(false)
     const [followUp, setFollowUp] = useState('')
+    const [followUpImage, setFollowUpImage] = useState<FollowUpImage | null>(null)
     const [followUpLoading, setFollowUpLoading] = useState(false)
     const [copiedCodeId, setCopiedCodeId] = useState<string | null>(null)
     const apiKeyInputRef = useRef<HTMLInputElement | null>(null)
+    const followUpImageInputRef = useRef<HTMLInputElement | null>(null)
     const chatSessionRef = useRef<any>(null)
 
 
@@ -124,6 +137,7 @@ const AssistantWidget: React.FC = () => {
         setNeedsScreenPermission(false)
         setMessages([])
         setFollowUp('')
+        setFollowUpImage(null)
         chatSessionRef.current = null
 
         try {
@@ -202,6 +216,8 @@ const AssistantWidget: React.FC = () => {
                 setResponse(`Error: ${message}`)
             }
             setMessages([])
+            setFollowUp('')
+            setFollowUpImage(null)
             chatSessionRef.current = null
         } finally {
             console.log('[RENDERER] Analysis session finished.')
@@ -220,18 +236,45 @@ const AssistantWidget: React.FC = () => {
 
     const sendFollowUp = async () => {
         const trimmed = followUp.trim()
-        if (!trimmed || followUpLoading) return
+        if ((!trimmed && !followUpImage) || followUpLoading) return
         if (!chatSessionRef.current) {
             setResponse('No active context. Run Quick Solve first.')
             return
         }
 
         setFollowUpLoading(true)
-        setMessages((prev) => [...prev, { role: 'user', text: trimmed }])
+        setMessages((prev) => [
+            ...prev,
+            {
+                role: 'user',
+                text: trimmed,
+                image: followUpImage
+                    ? {
+                        dataUrl: followUpImage.dataUrl,
+                        name: followUpImage.name,
+                    }
+                    : undefined,
+            },
+        ])
         setFollowUp('')
+        setFollowUpImage(null)
 
         try {
-            const result = await chatSessionRef.current.sendMessage(trimmed)
+            const parts: Array<{ text?: string; inlineData?: { data: string; mimeType: string } }> = []
+            if (trimmed) {
+                parts.push({ text: trimmed })
+            }
+            if (followUpImage) {
+                parts.push({
+                    inlineData: {
+                        data: followUpImage.base64,
+                        mimeType: followUpImage.mimeType,
+                    },
+                })
+            }
+
+            const payload = followUpImage ? parts : trimmed
+            const result = await chatSessionRef.current.sendMessage(payload)
             const text = result.response.text()
             const cleanText = text.trim()
             setMessages((prev) => [...prev, { role: 'assistant', text: cleanText }])
@@ -244,6 +287,31 @@ const AssistantWidget: React.FC = () => {
         } finally {
             setFollowUpLoading(false)
         }
+    }
+
+    const handleFollowUpImageChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+        const file = event.target.files?.[0]
+        event.target.value = ''
+        if (!file) return
+        if (!file.type.startsWith('image/')) {
+            console.warn('[RENDERER] Unsupported follow-up file type:', file.type)
+            return
+        }
+
+        const reader = new FileReader()
+        reader.onload = () => {
+            if (typeof reader.result !== 'string') return
+            const [header, base64] = reader.result.split(',')
+            const match = header.match(/data:(.*);base64/)
+            const mimeType = match?.[1] || file.type || 'image/png'
+            setFollowUpImage({
+                dataUrl: reader.result,
+                base64,
+                mimeType,
+                name: file.name,
+            })
+        }
+        reader.readAsDataURL(file)
     }
 
     const copyCodeBlock = (code: string, id: string) => {
@@ -320,6 +388,8 @@ const AssistantWidget: React.FC = () => {
         setModelName(nextModel)
         setShowSettings(false)
         setMessages([])
+        setFollowUp('')
+        setFollowUpImage(null)
         chatSessionRef.current = null
         console.log('[RENDERER] Settings updated.')
     }
@@ -357,6 +427,8 @@ const AssistantWidget: React.FC = () => {
                                         onClick={() => {
                                             setResponse(null)
                                             setMessages([])
+                                            setFollowUp('')
+                                            setFollowUpImage(null)
                                             setNeedsScreenPermission(false)
                                             chatSessionRef.current = null
                                         }}
@@ -390,6 +462,20 @@ const AssistantWidget: React.FC = () => {
                                                     {msg.role === 'user' ? 'You' : 'Assistant'}
                                                 </span>
                                                 {renderMessageContent(msg.text, `${msg.role}-${index}`)}
+                                                {msg.image && (
+                                                    <div className="mt-2">
+                                                        <img
+                                                            src={msg.image.dataUrl}
+                                                            alt={msg.image.name || 'Attached image'}
+                                                            className="max-h-40 w-auto rounded-xl border border-white/10"
+                                                        />
+                                                        {msg.image.name && (
+                                                            <div className="mt-1 text-[10px] text-white/40 truncate">
+                                                                {msg.image.name}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                )}
                                             </div>
                                         </div>
                                     ))}
@@ -410,7 +496,7 @@ const AssistantWidget: React.FC = () => {
                             {messages.length > 0 && (
                                 <div className="no-drag mt-4 border-t border-white/10 pt-3">
                                     <label className="block text-[10px] text-white/40 uppercase font-black mb-2">Follow-up</label>
-                                    <div className="flex gap-2">
+                                    <div className="flex gap-2 items-start">
                                         <textarea
                                             value={followUp}
                                             onChange={(e) => setFollowUp(e.target.value)}
@@ -424,15 +510,53 @@ const AssistantWidget: React.FC = () => {
                                             rows={2}
                                             className="no-drag bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs text-white w-full outline-none focus:border-blue-500/50 resize-none"
                                         />
-                                        <button
-                                            type="button"
-                                            onClick={sendFollowUp}
-                                            disabled={followUpLoading || !followUp.trim()}
-                                            className="no-drag bg-blue-600/20 hover:bg-blue-600/40 disabled:opacity-50 text-blue-200 px-3 py-2 rounded-xl text-xs font-bold transition-colors"
-                                        >
-                                            {followUpLoading ? '...' : 'Send'}
-                                        </button>
+                                        <div className="flex flex-col gap-2">
+                                            <button
+                                                type="button"
+                                                onClick={() => followUpImageInputRef.current?.click()}
+                                                className="no-drag bg-white/10 hover:bg-white/20 text-white/80 px-3 py-2 rounded-xl text-[10px] font-bold transition-colors"
+                                            >
+                                                Add Image
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={sendFollowUp}
+                                                disabled={followUpLoading || (!followUp.trim() && !followUpImage)}
+                                                className="no-drag bg-blue-600/20 hover:bg-blue-600/40 disabled:opacity-50 text-blue-200 px-3 py-2 rounded-xl text-xs font-bold transition-colors"
+                                            >
+                                                {followUpLoading ? '...' : 'Send'}
+                                            </button>
+                                        </div>
                                     </div>
+                                    {followUpImage && (
+                                        <div className="mt-3 flex items-center gap-2 rounded-xl border border-white/10 bg-black/40 p-2">
+                                            <img
+                                                src={followUpImage.dataUrl}
+                                                alt={followUpImage.name || 'Selected image'}
+                                                className="h-12 w-12 rounded-lg object-cover border border-white/10"
+                                            />
+                                            <div className="flex-1 min-w-0">
+                                                <div className="text-[10px] text-white/70 truncate">
+                                                    {followUpImage.name || 'Attached image'}
+                                                </div>
+                                                <div className="text-[9px] text-white/40">Included with your follow-up.</div>
+                                            </div>
+                                            <button
+                                                type="button"
+                                                onClick={() => setFollowUpImage(null)}
+                                                className="no-drag text-[10px] text-white/50 hover:text-white/80 transition-colors"
+                                            >
+                                                Remove
+                                            </button>
+                                        </div>
+                                    )}
+                                    <input
+                                        ref={followUpImageInputRef}
+                                        type="file"
+                                        accept="image/*"
+                                        onChange={handleFollowUpImageChange}
+                                        className="hidden"
+                                    />
                                 </div>
                             )}
                         </div>
