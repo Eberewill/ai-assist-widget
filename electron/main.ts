@@ -8,15 +8,25 @@ import fs from 'node:fs'
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
-const WINDOW_DEFAULT_WIDTH = 600
+const WINDOW_DEFAULT_WIDTH = 900
 const WINDOW_MIN_WIDTH = 120
-const WINDOW_MAX_WIDTH = 600
+const WINDOW_MAX_WIDTH = 1000
 const WINDOW_MIN_HEIGHT = 120
-const WINDOW_MAX_HEIGHT = 460
+const WINDOW_MAX_HEIGHT = 720
 const WINDOW_BOTTOM_MARGIN = 20
 const DEFAULT_FOCUSABLE = true
 
 const CAPTURE_HIDE_DELAY_MS = 300
+
+const PYTHON_BRIDGE_CANDIDATES = [
+    path.join(process.cwd(), 'python', 'bridge.py'),
+    path.join(__dirname, '../python/bridge.py'),
+    path.join(__dirname, '../../python/bridge.py'),
+]
+
+const PYTHON_COMMAND_CANDIDATES = Array.from(
+    new Set([process.env.PYTHON_PATH, 'python3', 'python'].filter(Boolean)),
+) as string[]
 
 let win: BrowserWindow | null = null
 let captureInProgress = false
@@ -60,6 +70,59 @@ function getActiveDisplayIndex() {
     const targetDisplay = screen.getDisplayNearestPoint(cursorPoint)
     const displays = screen.getAllDisplays()
     return displays.findIndex((display) => display.id === targetDisplay.id)
+}
+
+function resolvePythonBridgePath() {
+    const candidate = PYTHON_BRIDGE_CANDIDATES.find((candidatePath) => fs.existsSync(candidatePath))
+    if (!candidate) {
+        throw new Error('Python bridge script not found')
+    }
+    return candidate
+}
+
+function runPythonBridge(pythonCommand: string, bridgePath: string) {
+    return new Promise<any>((resolve, reject) => {
+        execFile(pythonCommand, [bridgePath], { env: process.env }, (error, stdout, stderr) => {
+            if (error) {
+                const message = stderr?.toString().trim() || error.message
+                const wrapped = new Error(`[PYTHON] ${message}`)
+                ;(wrapped as any).code = error.code
+                reject(wrapped)
+                return
+            }
+
+            const output = stdout?.toString().trim()
+            if (!output) {
+                resolve({})
+                return
+            }
+
+            try {
+                resolve(JSON.parse(output))
+            } catch (parseError) {
+                reject(new Error(`Failed to parse python bridge output: ${(parseError as Error).message} | Output: ${output}`))
+            }
+        })
+    })
+}
+
+async function collectSemanticStructure() {
+    const bridgePath = resolvePythonBridgePath()
+    let lastError: Error | null = null
+
+    for (const pythonCommand of PYTHON_COMMAND_CANDIDATES) {
+        try {
+            return await runPythonBridge(pythonCommand, bridgePath)
+        } catch (error) {
+            if (error instanceof Error && (error as any).code === 'ENOENT') {
+                lastError = error
+                continue
+            }
+            throw error
+        }
+    }
+
+    throw lastError || new Error('Python bridge failed to execute')
 }
 
 async function captureViaScreencapture() {
@@ -126,6 +189,15 @@ function registerIpcHandlers() {
             return base64
         } finally {
             captureInProgress = false
+        }
+    })
+
+    ipcMain.handle('analyze-screen-deep', async () => {
+        try {
+            return await collectSemanticStructure()
+        } catch (error) {
+            console.error('[MAIN] analyze-screen-deep failed:', error)
+            throw error instanceof Error ? error : new Error(String(error))
         }
     })
 

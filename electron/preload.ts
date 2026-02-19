@@ -2,7 +2,13 @@ import { contextBridge, ipcRenderer } from 'electron'
 
 console.log('[PRELOAD] Preload script starting...')
 
-const allowedChannels = new Set(['capture-screen', 'resize-window', 'set-focusable', 'open-screen-capture-settings'])
+const allowedChannels = new Set([
+    'capture-screen',
+    'resize-window',
+    'set-focusable',
+    'open-screen-capture-settings',
+    'analyze-screen-deep',
+])
 
 function ensureAllowed(channel: string) {
     if (!allowedChannels.has(channel)) {
