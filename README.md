@@ -1,10 +1,11 @@
 # AI Assist Widget
 
-Electron + Vite overlay that captures the screen and sends it to Gemini for a quick solution.
+Electron + Vite overlay that captures the screen and routes analysis through Codex CLI.
 
 ## Requirements
 - Node.js 18+
-- Gemini API key
+- Codex CLI installed (`codex --version`)
+- Codex authenticated (`codex login`)
 
 ## Setup
 ```bash
@@ -14,5 +15,6 @@ npm run dev
 
 ## Notes
 - macOS: enable Screen Recording for the app in System Settings > Privacy & Security > Screen Recording.
-- Set `ASSISTANT_DEBUG_CAPTURES=1` to save screenshots under your user data directory.
-- Model name is configurable in settings if your API key doesn't support the default.
+- Captures are processed in memory by default.
+- Set `ASSISTANT_DEBUG_CAPTURES=1` to save screenshots under the Electron user-data directory (`.../debug_captures`).
+- Model name is configurable in settings if you want to target a different Codex/OpenAI model.

@@ -1,13 +1,12 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
-console.log('[PRELOAD] Preload script starting...')
-
 const allowedChannels = new Set([
     'capture-screen',
     'resize-window',
     'set-focusable',
     'open-screen-capture-settings',
     'analyze-screen-deep',
+    'solve-with-codex',
 ])
 
 function ensureAllowed(channel: string) {
@@ -15,26 +14,26 @@ function ensureAllowed(channel: string) {
         throw new Error(`[PRELOAD] Blocked IPC channel: ${channel}`)
     }
 }
-// --------- Expose some API to the Renderer process ---------
+
 contextBridge.exposeInMainWorld('ipcRenderer', {
     on(...args: Parameters<typeof ipcRenderer.on>) {
         const [channel, listener] = args
         ensureAllowed(channel)
-        return ipcRenderer.on(channel, (event, ...args) => listener(event, ...args))
+        return ipcRenderer.on(channel, (event, ...innerArgs) => listener(event, ...innerArgs))
     },
     off(...args: Parameters<typeof ipcRenderer.off>) {
-        const [channel, ...omit] = args
+        const [channel, ...rest] = args
         ensureAllowed(channel)
-        return ipcRenderer.off(channel, ...omit)
+        return ipcRenderer.off(channel, ...rest)
     },
     send(...args: Parameters<typeof ipcRenderer.send>) {
-        const [channel, ...omit] = args
+        const [channel, ...rest] = args
         ensureAllowed(channel)
-        return ipcRenderer.send(channel, ...omit)
+        return ipcRenderer.send(channel, ...rest)
     },
     invoke(...args: Parameters<typeof ipcRenderer.invoke>) {
-        const [channel, ...omit] = args
+        const [channel, ...rest] = args
         ensureAllowed(channel)
-        return ipcRenderer.invoke(channel, ...omit)
+        return ipcRenderer.invoke(channel, ...rest)
     },
 })
