@@ -22,7 +22,7 @@ const DEBUG_CAPTURE_ENV = 'ASSISTANT_DEBUG_CAPTURES'
 const DEBUG_CAPTURE_DIR = 'debug_captures'
 const CODEX_DEFAULT_MODEL = 'gpt-5'
 const GEMINI_DEFAULT_MODEL = 'gemini-2.0-flash'
-const KIMI_DEFAULT_MODEL = 'kimi-k2-0711-preview'
+const KIMI_DEFAULT_MODEL = 'kimi-k2.5'
 const MAX_HISTORY_MESSAGES = 10
 const MAX_SEMANTIC_CHARS = 18000
 
@@ -56,6 +56,8 @@ type SolveRequest = {
     imageMimeType?: string
     semanticStructure?: unknown
     messages?: SolveMessage[]
+    ghostMode?: boolean
+    selectedText?: string
 }
 
 type PythonBridgeData = Record<string, unknown>
@@ -238,9 +240,9 @@ function resolvePythonBridgePath() {
     return candidate
 }
 
-function runPythonBridge(pythonCommand: string, bridgePath: string) {
+function runPythonBridge(pythonCommand: string, bridgePath: string, args: string[] = []) {
     return new Promise<PythonBridgeData>((resolve, reject) => {
-        execFile(pythonCommand, [bridgePath], { env: process.env }, (error, stdout, stderr) => {
+        execFile(pythonCommand, [bridgePath, ...args], { env: process.env }, (error, stdout, stderr) => {
             if (error) {
                 const message = stderr?.toString().trim() || error.message
                 const wrapped = new Error(`[PYTHON] ${message}`)
@@ -276,6 +278,30 @@ async function collectSemanticStructure() {
     for (const pythonCommand of PYTHON_COMMAND_CANDIDATES) {
         try {
             return await runPythonBridge(pythonCommand, bridgePath)
+        } catch (error) {
+            const candidateError = error as NodeJS.ErrnoException
+            if (candidateError.code === 'ENOENT') {
+                lastError = candidateError
+                continue
+            }
+            throw error
+        }
+    }
+
+    throw lastError || new Error('Python bridge failed to execute')
+}
+
+async function getSelectedText(): Promise<{ success: boolean; text?: string; error?: string }> {
+    const bridgePath = resolvePythonBridgePath()
+    let lastError: Error | null = null
+
+    for (const pythonCommand of PYTHON_COMMAND_CANDIDATES) {
+        try {
+            const result = await runPythonBridge(pythonCommand, bridgePath, ['get-selected-text'])
+            if (typeof result === 'object' && result !== null) {
+                return result as { success: boolean; text?: string; error?: string }
+            }
+            return { success: false, error: 'Invalid response from Python bridge' }
         } catch (error) {
             const candidateError = error as NodeJS.ErrnoException
             if (candidateError.code === 'ENOENT') {
@@ -341,6 +367,11 @@ function buildAIPrompt(request: SolveRequest) {
     const history = request.messages ?? []
     if (history.length) {
         sections.push(`Conversation history:\n${formatConversation(history)}`)
+    }
+
+    // Include selected text if available (Ghost Mode)
+    if (request.selectedText) {
+        sections.push(`USER'S CURRENTLY SELECTED TEXT:\n"""\n${request.selectedText}\n"""\n\nUse this selected text as the primary context for solving the user's request.`)
     }
 
     if (request.semanticStructure !== undefined) {
@@ -577,6 +608,9 @@ async function solveWithKimi(request: SolveRequest) {
         throw new Error('Kimi API key is required. Please add your API key in settings.')
     }
 
+    // Log key info for debugging (mask the actual key)
+    console.log('[MAIN] Kimi API Key present:', apiKey ? `Yes (${apiKey.length} chars, starts with ${apiKey.slice(0, 4)}...)` : 'No')
+
     const model = request.model?.trim() || KIMI_DEFAULT_MODEL
     const prompt = buildAIPrompt(request)
 
@@ -640,6 +674,7 @@ async function solveWithKimi(request: SolveRequest) {
             },
             (res) => {
                 let data = ''
+                console.log('[MAIN] Kimi API response status:', res.statusCode)
                 res.on('data', (chunk) => {
                     data += chunk
                 })
@@ -647,6 +682,7 @@ async function solveWithKimi(request: SolveRequest) {
                     try {
                         const response = JSON.parse(data)
                         if (response.error) {
+                            console.error('[MAIN] Kimi API error response:', JSON.stringify(response.error))
                             reject(new Error(`Kimi API error: ${response.error.message || JSON.stringify(response.error)}`))
                             return
                         }
@@ -657,6 +693,7 @@ async function solveWithKimi(request: SolveRequest) {
                         }
                         resolve(text)
                     } catch (parseError) {
+                        console.error('[MAIN] Kimi raw response:', data)
                         reject(new Error(`Failed to parse Kimi response: ${(parseError as Error).message}`))
                     }
                 })
@@ -696,10 +733,12 @@ async function solveWithAI(request: SolveRequest) {
 function registerIpcHandlers() {
     ipcMain.removeHandler('capture-screen')
     ipcMain.removeHandler('resize-window')
+    ipcMain.removeHandler('set-focusable')
     ipcMain.removeHandler('open-screen-capture-settings')
     ipcMain.removeHandler('analyze-screen-deep')
     ipcMain.removeHandler('solve-with-codex')
     ipcMain.removeHandler('solve-with-ai')
+    ipcMain.removeHandler('get-selected-text')
 
     ipcMain.handle('capture-screen', async () => {
         if (captureInProgress) throw new Error('Capture already in progress')
@@ -731,9 +770,21 @@ function registerIpcHandlers() {
         }
     })
 
-    // New unified AI handler
+    // New unified AI handler with Ghost Mode support
     ipcMain.handle('solve-with-ai', async (_event, request: SolveRequest) => {
         try {
+            // If ghost mode is enabled, automatically get selected text
+            if (request.ghostMode) {
+                try {
+                    const selectedResult = await getSelectedText()
+                    if (selectedResult.success && selectedResult.text) {
+                        request.selectedText = selectedResult.text
+                    }
+                } catch (ghostError) {
+                    console.warn('[MAIN] Ghost mode failed to get selected text:', ghostError)
+                    // Continue without selected text if ghost mode fails
+                }
+            }
             return await solveWithAI(request)
         } catch (error) {
             console.error('[MAIN] solve-with-ai failed:', error)
@@ -741,8 +792,27 @@ function registerIpcHandlers() {
         }
     })
 
+    ipcMain.handle('get-selected-text', async () => {
+        try {
+            return await getSelectedText()
+        } catch (error) {
+            console.error('[MAIN] get-selected-text failed:', error)
+            throw error instanceof Error ? error : new Error(String(error))
+        }
+    })
+
     ipcMain.handle('resize-window', (_event, { width, height }) => {
         setWindowSize(width || WINDOW_DEFAULT_WIDTH, height || WINDOW_MIN_HEIGHT)
+    })
+
+    // Temporarily enable/disable focus for settings input fields
+    ipcMain.handle('set-focusable', (_event, { focusable }: { focusable: boolean }) => {
+        if (win) {
+            win.setFocusable(focusable)
+            if (focusable) {
+                win.focus()
+            }
+        }
     })
 
     ipcMain.handle('open-screen-capture-settings', () => {
@@ -783,18 +853,10 @@ function createWindow() {
         win.setFullScreenable(false)
     }
 
-    // Prevent the window from taking focus on click
+    // Prevent the window from taking focus on click (when focusable is false)
     win.setIgnoreMouseEvents(false)
     
-    // Handle focus-stealing prevention
-    win.on('focus', () => {
-        // Immediately blur the window if it somehow gets focus
-        if (win) {
-            win.blur()
-        }
-    })
-
-    // Prevent window from activating on show
+    // Maintain always-on-top when window shows
     win.on('show', () => {
         if (win && process.platform === 'darwin') {
             win.setAlwaysOnTop(true, 'screen-saver', 1)

@@ -7,7 +7,7 @@ const COLLAPSED_WIDTH = 120
 const EXPANDED_WIDTH = 960
 const DEFAULT_MODEL = 'gpt-5'
 const DEFAULT_GEMINI_MODEL = 'gemini-2.0-flash'
-const DEFAULT_KIMI_MODEL = 'kimi-k2-0711-preview'
+const DEFAULT_KIMI_MODEL = 'kimi-k2.5'
 
 type ChatRole = 'user' | 'assistant'
 
@@ -51,6 +51,7 @@ type SolveRequest = {
         role: ChatRole
         text: string
     }>
+    ghostMode?: boolean
 }
 
 function getIpcBridge() {
@@ -151,6 +152,8 @@ const AssistantWidget: React.FC = () => {
     const [modelName, setModelName] = useState(localStorage.getItem('ai_model') || DEFAULT_MODEL)
     const [geminiApiKey, setGeminiApiKey] = useState(localStorage.getItem('gemini_api_key') || '')
     const [kimiApiKey, setKimiApiKey] = useState(localStorage.getItem('kimi_api_key') || '')
+    const [ghostMode, setGhostMode] = useState(localStorage.getItem('ghost_mode') === 'true')
+    const [stealthMode, setStealthMode] = useState(localStorage.getItem('stealth_mode') !== 'false') // Default ON
 
     const followUpImageInputRef = useRef<HTMLInputElement | null>(null)
 
@@ -189,6 +192,20 @@ const AssistantWidget: React.FC = () => {
             console.warn('[RENDERER] Window resize failed:', error)
         })
     }, [response, messages.length, showSettings, isCollapsed])
+
+    // Enable focus when settings is open or stealth mode is off
+    useEffect(() => {
+        const ipc = getIpcBridge()
+        if (!ipc?.invoke) {
+            return
+        }
+
+        // Focusable when: settings is open OR stealth mode is disabled
+        const shouldBeFocusable = showSettings || !stealthMode
+        ipc.invoke('set-focusable', { focusable: shouldBeFocusable }).catch((error: unknown) => {
+            console.warn('[RENDERER] Focus toggle failed:', error)
+        })
+    }, [showSettings, stealthMode])
 
     const runAISolve = async (request: SolveRequest) => {
         const ipc = getIpcBridge()
@@ -247,6 +264,7 @@ const AssistantWidget: React.FC = () => {
                 prompt: buildQuickSolvePrompt(sessionContext),
                 imageBase64: captureData,
                 imageMimeType: 'image/png',
+                ghostMode,
             })
 
             const { cleanText, suggestions } = processResponse(fullText)
@@ -308,6 +326,7 @@ const AssistantWidget: React.FC = () => {
                 imageBase64: captureData,
                 imageMimeType: 'image/png',
                 semanticStructure: structure,
+                ghostMode,
             })
 
             const { cleanText, suggestions } = processResponse(fullText)
@@ -380,6 +399,7 @@ const AssistantWidget: React.FC = () => {
                 imageBase64: followUpImage?.base64,
                 imageMimeType: followUpImage?.mimeType,
                 messages: nextMessages.map(({ role, text }) => ({ role, text })),
+                ghostMode,
             })
 
             const { cleanText, suggestions } = processResponse(fullText)
@@ -453,8 +473,14 @@ const AssistantWidget: React.FC = () => {
         localStorage.setItem('ai_model', nextModel)
         localStorage.setItem('gemini_api_key', geminiApiKey)
         localStorage.setItem('kimi_api_key', kimiApiKey)
+        localStorage.setItem('ghost_mode', String(ghostMode))
+        localStorage.setItem('stealth_mode', String(stealthMode))
         setShowSettings(false)
-        setResponse(`Settings updated. Using ${provider.toUpperCase()} with model: ${nextModel}`)
+        const modeLabels = []
+        if (ghostMode) modeLabels.push('Ghost')
+        if (stealthMode) modeLabels.push('Stealth')
+        const modeText = modeLabels.length > 0 ? ` (${modeLabels.join(' + ')} ON)` : ''
+        setResponse(`Settings updated. Using ${provider.toUpperCase()} with model: ${nextModel}${modeText}`)
     }
 
     const openScreenRecordingSettings = () => {
@@ -463,26 +489,24 @@ const AssistantWidget: React.FC = () => {
     }
 
     const getProviderLabel = () => {
+        let label = 'Codex'
         switch (provider) {
             case 'gemini':
-                return 'Gemini'
+                label = 'Gemini'
+                break
             case 'kimi':
-                return 'Kimi'
-            default:
-                return 'Codex'
+                label = 'Kimi'
+                break
         }
+        const modes = []
+        if (ghostMode) modes.push('Ghost')
+        if (stealthMode) modes.push('Stealth')
+        return modes.length > 0 ? `${label} • ${modes.join('+')}` : label
     }
 
-    const getModelPlaceholder = () => {
-        switch (provider) {
-            case 'gemini':
-                return DEFAULT_GEMINI_MODEL
-            case 'kimi':
-                return DEFAULT_KIMI_MODEL
-            default:
-                return DEFAULT_MODEL
-        }
-    }
+    const modelPlaceholder = provider === 'gemini' ? DEFAULT_GEMINI_MODEL : provider === 'kimi' ? DEFAULT_KIMI_MODEL : DEFAULT_MODEL
+    // Use modelPlaceholder to avoid TypeScript unused variable warning
+    void modelPlaceholder
 
     return (
         <div className="widget-layer flex flex-col items-stretch gap-3 pt-6 w-full px-4" aria-hidden="true">
@@ -671,20 +695,75 @@ const AssistantWidget: React.FC = () => {
                                         </div>
                                     </div>
 
-                                    {/* Model Input */}
+                                    {/* Ghost Mode Toggle */}
+                                    <div className="space-y-2">
+                                        <div className="flex items-center justify-between">
+                                            <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Ghost Mode</label>
+                                            <button
+                                                type="button"
+                                                onClick={() => setGhostMode(!ghostMode)}
+                                                className={`no-drag relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                                                    ghostMode ? 'bg-blue-600' : 'bg-white/10'
+                                                }`}
+                                            >
+                                                <span
+                                                    className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
+                                                        ghostMode ? 'translate-x-5' : 'translate-x-1'
+                                                    }`}
+                                                />
+                                            </button>
+                                        </div>
+                                        <p className="text-[9px] text-white/30">
+                                            {ghostMode 
+                                                ? 'Automatically reads selected text without Cmd+C' 
+                                                : 'Turn on to auto-capture selected text on solve'}
+                                        </p>
+                                    </div>
+
+                                    {/* Stealth Mode Toggle */}
+                                    <div className="space-y-2">
+                                        <div className="flex items-center justify-between">
+                                            <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Stealth Mode</label>
+                                            <button
+                                                type="button"
+                                                onClick={() => setStealthMode(!stealthMode)}
+                                                className={`no-drag relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                                                    stealthMode ? 'bg-purple-600' : 'bg-white/10'
+                                                }`}
+                                            >
+                                                <span
+                                                    className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
+                                                        stealthMode ? 'translate-x-5' : 'translate-x-1'
+                                                    }`}
+                                                />
+                                            </button>
+                                        </div>
+                                        <p className="text-[9px] text-white/30">
+                                            {stealthMode 
+                                                ? 'Widget stays invisible to other apps (disables typing)' 
+                                                : 'Turn OFF to enable typing in settings'}
+                                        </p>
+                                        {!stealthMode && (
+                                            <p className="text-[9px] text-yellow-400/70">
+                                                ⚠️ Other apps may detect widget focus
+                                            </p>
+                                        )}
+                                    </div>
+
+                                    {/* Model Input --}
                                     <div className="space-y-2">
                                         <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Model</label>
                                         <input 
                                             type="text" 
                                             value={modelName} 
                                             onChange={(e) => setModelName(e.target.value)} 
-                                            placeholder={getModelPlaceholder()} 
+                                            placeholder={modelPlaceholder} 
                                             className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-sm text-white w-full outline-none focus:border-blue-500/50" 
                                         />
                                         <p className="text-[9px] text-white/30">
                                             {provider === 'codex' && 'Default: gpt-5'}
                                             {provider === 'gemini' && 'Default: gemini-2.0-flash'}
-                                            {provider === 'kimi' && 'Default: kimi-k2-0711-preview'}
+                                            {provider === 'kimi' && 'Default: kimi-k2.5'}
                                         </p>
                                     </div>
 
