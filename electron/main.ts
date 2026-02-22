@@ -4,6 +4,7 @@ import path from 'node:path'
 import os from 'node:os'
 import fs from 'node:fs'
 import { execFile } from 'node:child_process'
+import https from 'node:https'
 
 // ESM __dirname workaround
 const __filename = fileURLToPath(import.meta.url)
@@ -20,6 +21,8 @@ const CAPTURE_HIDE_DELAY_MS = 300
 const DEBUG_CAPTURE_ENV = 'ASSISTANT_DEBUG_CAPTURES'
 const DEBUG_CAPTURE_DIR = 'debug_captures'
 const CODEX_DEFAULT_MODEL = 'gpt-5'
+const GEMINI_DEFAULT_MODEL = 'gemini-2.0-flash'
+const KIMI_DEFAULT_MODEL = 'kimi-k2-0711-preview'
 const MAX_HISTORY_MESSAGES = 10
 const MAX_SEMANTIC_CHARS = 18000
 
@@ -35,6 +38,8 @@ const PYTHON_COMMAND_CANDIDATES = Array.from(
 
 const CODEX_COMMAND_CANDIDATES = Array.from(new Set([process.env.CODEX_PATH, 'codex'].filter(Boolean))) as string[]
 
+type AIProvider = 'codex' | 'gemini' | 'kimi'
+
 type ChatRole = 'user' | 'assistant'
 
 type SolveMessage = {
@@ -42,9 +47,11 @@ type SolveMessage = {
     text: string
 }
 
-type SolveWithCodexRequest = {
+type SolveRequest = {
     prompt?: string
     model?: string
+    provider?: AIProvider
+    apiKey?: string
     imageBase64?: string
     imageMimeType?: string
     semanticStructure?: unknown
@@ -314,7 +321,7 @@ function formatConversation(messages: SolveMessage[]) {
         .join('\n\n')
 }
 
-function buildCodexPrompt(request: SolveWithCodexRequest) {
+function buildAIPrompt(request: SolveRequest) {
     const sections: string[] = []
     const prompt = request.prompt?.trim()
 
@@ -346,6 +353,8 @@ function buildCodexPrompt(request: SolveWithCodexRequest) {
 
     return sections.join('\n\n')
 }
+
+// ===== Codex Implementation =====
 
 type CodexCommandResult = {
     stdout: string
@@ -400,8 +409,8 @@ async function runCodexWithFallback(args: string[]) {
     throw lastError || new Error('Codex CLI not found. Install Codex CLI or set CODEX_PATH.')
 }
 
-async function solveWithCodex(request: SolveWithCodexRequest) {
-    const prompt = buildCodexPrompt(request)
+async function solveWithCodex(request: SolveRequest) {
+    const prompt = buildAIPrompt(request)
     const model = request.model?.trim() || CODEX_DEFAULT_MODEL
 
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-assist-codex-'))
@@ -426,8 +435,6 @@ async function solveWithCodex(request: SolveWithCodexRequest) {
             fs.writeFileSync(imagePath, imageBuffer)
         }
 
-        // Override local Codex config that can break headless app execution
-        // (e.g. unsupported reasoning levels or interactive MCP login requirements).
         const args = [
             'exec',
             '-c',
@@ -449,8 +456,6 @@ async function solveWithCodex(request: SolveWithCodexRequest) {
             args.push('--image', imagePath)
         }
 
-        // `--` is required by newer Codex CLI builds when using `--image`,
-        // otherwise prompt parsing can fall through to stdin mode.
         args.push('--', prompt)
 
         const commandResult = await runCodexWithFallback(args)
@@ -474,6 +479,220 @@ async function solveWithCodex(request: SolveWithCodexRequest) {
     }
 }
 
+// ===== Gemini Implementation =====
+
+async function solveWithGemini(request: SolveRequest) {
+    const apiKey = request.apiKey
+    if (!apiKey) {
+        throw new Error('Gemini API key is required. Please add your API key in settings.')
+    }
+
+    const model = request.model?.trim() || GEMINI_DEFAULT_MODEL
+    const prompt = buildAIPrompt(request)
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`
+
+    const parts: Array<{ text?: string; inlineData?: { mimeType: string; data: string } }> = [
+        { text: prompt }
+    ]
+
+    if (request.imageBase64) {
+        const normalizedBase64 = normalizeBase64(request.imageBase64).trim()
+        if (normalizedBase64) {
+            parts.unshift({
+                inlineData: {
+                    mimeType: request.imageMimeType || 'image/png',
+                    data: normalizedBase64
+                }
+            })
+        }
+    }
+
+    const body = {
+        contents: [
+            {
+                parts
+            }
+        ],
+        generationConfig: {
+            temperature: 0.7,
+            maxOutputTokens: 4096,
+        }
+    }
+
+    return new Promise<string>((resolve, reject) => {
+        const req = https.request(
+            url,
+            {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                timeout: 60000,
+            },
+            (res) => {
+                let data = ''
+                res.on('data', (chunk) => {
+                    data += chunk
+                })
+                res.on('end', () => {
+                    try {
+                        const response = JSON.parse(data)
+                        if (response.error) {
+                            reject(new Error(`Gemini API error: ${response.error.message || JSON.stringify(response.error)}`))
+                            return
+                        }
+                        const text = response.candidates?.[0]?.content?.parts?.[0]?.text
+                        if (!text) {
+                            reject(new Error('Gemini returned an empty response'))
+                            return
+                        }
+                        resolve(text)
+                    } catch (parseError) {
+                        reject(new Error(`Failed to parse Gemini response: ${(parseError as Error).message}`))
+                    }
+                })
+            }
+        )
+
+        req.on('error', (error) => {
+            reject(new Error(`Gemini API request failed: ${error.message}`))
+        })
+
+        req.on('timeout', () => {
+            req.destroy()
+            reject(new Error('Gemini API request timed out'))
+        })
+
+        req.write(JSON.stringify(body))
+        req.end()
+    })
+}
+
+// ===== Kimi Implementation =====
+
+async function solveWithKimi(request: SolveRequest) {
+    const apiKey = request.apiKey
+    if (!apiKey) {
+        throw new Error('Kimi API key is required. Please add your API key in settings.')
+    }
+
+    const model = request.model?.trim() || KIMI_DEFAULT_MODEL
+    const prompt = buildAIPrompt(request)
+
+    const url = 'https://api.moonshot.cn/v1/chat/completions'
+
+    const messages: Array<{ role: string; content: string | Array<{ type: string; text?: string; image_url?: { url: string } }> }> = []
+
+    // Add conversation history if available
+    if (request.messages && request.messages.length > 0) {
+        for (const msg of request.messages.slice(-MAX_HISTORY_MESSAGES)) {
+            messages.push({
+                role: msg.role,
+                content: msg.text
+            })
+        }
+    }
+
+    // Build the current message with image if present
+    const currentMessage: { role: string; content: Array<{ type: string; text?: string; image_url?: { url: string } }> } = {
+        role: 'user',
+        content: []
+    }
+
+    if (request.imageBase64) {
+        const normalizedBase64 = normalizeBase64(request.imageBase64).trim()
+        if (normalizedBase64) {
+            const mimeType = request.imageMimeType || 'image/png'
+            currentMessage.content.push({
+                type: 'image_url',
+                image_url: {
+                    url: `data:${mimeType};base64,${normalizedBase64}`
+                }
+            })
+        }
+    }
+
+    currentMessage.content.push({
+        type: 'text',
+        text: prompt
+    })
+
+    messages.push(currentMessage)
+
+    const body = {
+        model,
+        messages,
+        temperature: 0.7,
+        max_tokens: 4096,
+    }
+
+    return new Promise<string>((resolve, reject) => {
+        const req = https.request(
+            url,
+            {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`,
+                },
+                timeout: 60000,
+            },
+            (res) => {
+                let data = ''
+                res.on('data', (chunk) => {
+                    data += chunk
+                })
+                res.on('end', () => {
+                    try {
+                        const response = JSON.parse(data)
+                        if (response.error) {
+                            reject(new Error(`Kimi API error: ${response.error.message || JSON.stringify(response.error)}`))
+                            return
+                        }
+                        const text = response.choices?.[0]?.message?.content
+                        if (!text) {
+                            reject(new Error('Kimi returned an empty response'))
+                            return
+                        }
+                        resolve(text)
+                    } catch (parseError) {
+                        reject(new Error(`Failed to parse Kimi response: ${(parseError as Error).message}`))
+                    }
+                })
+            }
+        )
+
+        req.on('error', (error) => {
+            reject(new Error(`Kimi API request failed: ${error.message}`))
+        })
+
+        req.on('timeout', () => {
+            req.destroy()
+            reject(new Error('Kimi API request timed out'))
+        })
+
+        req.write(JSON.stringify(body))
+        req.end()
+    })
+}
+
+// ===== Main AI Router =====
+
+async function solveWithAI(request: SolveRequest) {
+    const provider = request.provider || 'codex'
+
+    switch (provider) {
+        case 'gemini':
+            return solveWithGemini(request)
+        case 'kimi':
+            return solveWithKimi(request)
+        case 'codex':
+        default:
+            return solveWithCodex(request)
+    }
+}
+
 function registerIpcHandlers() {
     ipcMain.removeHandler('capture-screen')
     ipcMain.removeHandler('resize-window')
@@ -481,6 +700,7 @@ function registerIpcHandlers() {
     ipcMain.removeHandler('open-screen-capture-settings')
     ipcMain.removeHandler('analyze-screen-deep')
     ipcMain.removeHandler('solve-with-codex')
+    ipcMain.removeHandler('solve-with-ai')
 
     ipcMain.handle('capture-screen', async () => {
         if (captureInProgress) throw new Error('Capture already in progress')
@@ -502,11 +722,22 @@ function registerIpcHandlers() {
         }
     })
 
-    ipcMain.handle('solve-with-codex', async (_event, request: SolveWithCodexRequest) => {
+    // Keep backward compatibility
+    ipcMain.handle('solve-with-codex', async (_event, request: SolveRequest) => {
         try {
             return await solveWithCodex(request)
         } catch (error) {
             console.error('[MAIN] solve-with-codex failed:', error)
+            throw error instanceof Error ? error : new Error(String(error))
+        }
+    })
+
+    // New unified AI handler
+    ipcMain.handle('solve-with-ai', async (_event, request: SolveRequest) => {
+        try {
+            return await solveWithAI(request)
+        } catch (error) {
+            console.error('[MAIN] solve-with-ai failed:', error)
             throw error instanceof Error ? error : new Error(String(error))
         }
     })
@@ -552,7 +783,6 @@ function createWindow() {
     if (process.platform === 'darwin') {
         win.setWindowButtonVisibility(false)
         win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
-        // Make the window invisible to screen capture and recording
         win.setContentProtection(true)
     }
 

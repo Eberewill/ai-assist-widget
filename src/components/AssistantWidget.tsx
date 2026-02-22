@@ -1,11 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react'
 
 const COLLAPSED_HEIGHT = 120
-const SETTINGS_HEIGHT = 360
+const SETTINGS_HEIGHT = 520
 const RESPONSE_HEIGHT = 560
 const COLLAPSED_WIDTH = 120
 const EXPANDED_WIDTH = 960
 const DEFAULT_MODEL = 'gpt-5'
+const DEFAULT_GEMINI_MODEL = 'gemini-2.0-flash'
+const DEFAULT_KIMI_MODEL = 'kimi-k2-0711-preview'
 
 type ChatRole = 'user' | 'assistant'
 
@@ -31,13 +33,17 @@ type MessagePart = {
     language?: string
 }
 
+type AIProvider = 'codex' | 'gemini' | 'kimi'
+
 type IpcRendererBridge = {
     invoke(channel: string, ...args: unknown[]): Promise<unknown>
 }
 
-type SolveWithCodexRequest = {
+type SolveRequest = {
     prompt: string
     model: string
+    provider: AIProvider
+    apiKey?: string
     imageBase64?: string
     imageMimeType?: string
     semanticStructure?: unknown
@@ -127,7 +133,6 @@ const AssistantWidget: React.FC = () => {
     const [analyzingDeep, setAnalyzingDeep] = useState(false)
     const [response, setResponse] = useState<string | null>(null)
     const [messages, setMessages] = useState<ChatMessage[]>([])
-    const [modelName, setModelName] = useState(localStorage.getItem('codex_model') || DEFAULT_MODEL)
     const [showSettings, setShowSettings] = useState(false)
     const [copied, setCopied] = useState(false)
     const [isCollapsed, setIsCollapsed] = useState(false)
@@ -139,13 +144,32 @@ const AssistantWidget: React.FC = () => {
     const [recommendations, setRecommendations] = useState<string[]>([])
     const [sessionContext, setSessionContext] = useState('')
 
+    // Provider and API settings
+    const [provider, setProvider] = useState<AIProvider>(
+        (localStorage.getItem('ai_provider') as AIProvider) || 'codex'
+    )
+    const [modelName, setModelName] = useState(localStorage.getItem('ai_model') || DEFAULT_MODEL)
+    const [geminiApiKey, setGeminiApiKey] = useState(localStorage.getItem('gemini_api_key') || '')
+    const [kimiApiKey, setKimiApiKey] = useState(localStorage.getItem('kimi_api_key') || '')
+
     const followUpImageInputRef = useRef<HTMLInputElement | null>(null)
 
     useEffect(() => {
-        localStorage.removeItem('gemini_api_key')
-        localStorage.removeItem('gemini_model')
-        localStorage.removeItem('gemini_interview_context')
-    }, [])
+        // Update model when provider changes to appropriate default
+        const savedModel = localStorage.getItem('ai_model')
+        if (!savedModel) {
+            switch (provider) {
+                case 'gemini':
+                    setModelName(DEFAULT_GEMINI_MODEL)
+                    break
+                case 'kimi':
+                    setModelName(DEFAULT_KIMI_MODEL)
+                    break
+                default:
+                    setModelName(DEFAULT_MODEL)
+            }
+        }
+    }, [provider])
 
     useEffect(() => {
         const ipc = getIpcBridge()
@@ -177,18 +201,29 @@ const AssistantWidget: React.FC = () => {
         })
     }, [showSettings, isCollapsed])
 
-    const runCodexSolve = async (request: SolveWithCodexRequest) => {
+    const runAISolve = async (request: SolveRequest) => {
         const ipc = getIpcBridge()
         if (!ipc?.invoke) {
             throw new Error('IPC Bridge not found.')
         }
 
-        const result = await ipc.invoke('solve-with-codex', request)
+        const result = await ipc.invoke('solve-with-ai', request)
         if (typeof result !== 'string' || !result.trim()) {
-            throw new Error('Codex returned an empty response')
+            throw new Error('AI returned an empty response')
         }
 
         return result.trim()
+    }
+
+    const getApiKey = (): string | undefined => {
+        switch (provider) {
+            case 'gemini':
+                return geminiApiKey || undefined
+            case 'kimi':
+                return kimiApiKey || undefined
+            default:
+                return undefined
+        }
     }
 
     const handleCapture = async () => {
@@ -198,7 +233,10 @@ const AssistantWidget: React.FC = () => {
             return
         }
 
-        const selectedModel = modelName.trim() || DEFAULT_MODEL
+        const selectedModel = modelName.trim() || (
+            provider === 'gemini' ? DEFAULT_GEMINI_MODEL :
+            provider === 'kimi' ? DEFAULT_KIMI_MODEL : DEFAULT_MODEL
+        )
 
         setLoading(true)
         setResponse(null)
@@ -213,8 +251,10 @@ const AssistantWidget: React.FC = () => {
                 throw new Error('No image data received from capture-screen')
             }
 
-            const fullText = await runCodexSolve({
+            const fullText = await runAISolve({
+                provider,
                 model: selectedModel,
+                apiKey: getApiKey(),
                 prompt: buildQuickSolvePrompt(sessionContext),
                 imageBase64: captureData,
                 imageMimeType: 'image/png',
@@ -222,7 +262,7 @@ const AssistantWidget: React.FC = () => {
 
             const { cleanText, suggestions } = processResponse(fullText)
             if (!cleanText) {
-                setResponse('Codex did not return a usable answer.')
+                setResponse('AI did not return a usable answer.')
                 setRecommendations([])
                 return
             }
@@ -251,7 +291,10 @@ const AssistantWidget: React.FC = () => {
             return
         }
 
-        const selectedModel = modelName.trim() || DEFAULT_MODEL
+        const selectedModel = modelName.trim() || (
+            provider === 'gemini' ? DEFAULT_GEMINI_MODEL :
+            provider === 'kimi' ? DEFAULT_KIMI_MODEL : DEFAULT_MODEL
+        )
 
         setAnalyzingDeep(true)
         setResponse(null)
@@ -268,8 +311,10 @@ const AssistantWidget: React.FC = () => {
                 throw new Error('No image data received from capture-screen')
             }
 
-            const fullText = await runCodexSolve({
+            const fullText = await runAISolve({
+                provider,
                 model: selectedModel,
+                apiKey: getApiKey(),
                 prompt: buildDeepSolvePrompt(sessionContext),
                 imageBase64: captureData,
                 imageMimeType: 'image/png',
@@ -278,7 +323,7 @@ const AssistantWidget: React.FC = () => {
 
             const { cleanText, suggestions } = processResponse(fullText)
             if (!cleanText) {
-                setResponse('Codex did not return a usable deep analysis.')
+                setResponse('AI did not return a usable deep analysis.')
                 setRecommendations([])
                 return
             }
@@ -312,7 +357,10 @@ const AssistantWidget: React.FC = () => {
             return
         }
 
-        const selectedModel = modelName.trim() || DEFAULT_MODEL
+        const selectedModel = modelName.trim() || (
+            provider === 'gemini' ? DEFAULT_GEMINI_MODEL :
+            provider === 'kimi' ? DEFAULT_KIMI_MODEL : DEFAULT_MODEL
+        )
         const userText = trimmed || '[Attached image for follow-up]'
 
         const userMessage: ChatMessage = {
@@ -335,8 +383,10 @@ const AssistantWidget: React.FC = () => {
         setRecommendations([])
 
         try {
-            const fullText = await runCodexSolve({
+            const fullText = await runAISolve({
+                provider,
                 model: selectedModel,
+                apiKey: getApiKey(),
                 prompt: buildFollowUpPrompt(trimmed, sessionContext),
                 imageBase64: followUpImage?.base64,
                 imageMimeType: followUpImage?.mimeType,
@@ -406,15 +456,43 @@ const AssistantWidget: React.FC = () => {
 
     const saveSettings = (e: React.FormEvent) => {
         e.preventDefault()
-        const nextModel = modelName.trim() || DEFAULT_MODEL
-        localStorage.setItem('codex_model', nextModel)
+        const nextModel = modelName.trim() || (
+            provider === 'gemini' ? DEFAULT_GEMINI_MODEL :
+            provider === 'kimi' ? DEFAULT_KIMI_MODEL : DEFAULT_MODEL
+        )
+        localStorage.setItem('ai_provider', provider)
+        localStorage.setItem('ai_model', nextModel)
+        localStorage.setItem('gemini_api_key', geminiApiKey)
+        localStorage.setItem('kimi_api_key', kimiApiKey)
         setShowSettings(false)
-        setResponse('Settings updated. Codex model saved locally.')
+        setResponse(`Settings updated. Using ${provider.toUpperCase()} with model: ${nextModel}`)
     }
 
     const openScreenRecordingSettings = () => {
         const ipc = getIpcBridge()
         ipc?.invoke('open-screen-capture-settings')
+    }
+
+    const getProviderLabel = () => {
+        switch (provider) {
+            case 'gemini':
+                return 'Gemini'
+            case 'kimi':
+                return 'Kimi'
+            default:
+                return 'Codex'
+        }
+    }
+
+    const getModelPlaceholder = () => {
+        switch (provider) {
+            case 'gemini':
+                return DEFAULT_GEMINI_MODEL
+            case 'kimi':
+                return DEFAULT_KIMI_MODEL
+            default:
+                return DEFAULT_MODEL
+        }
     }
 
     return (
@@ -436,7 +514,7 @@ const AssistantWidget: React.FC = () => {
                                     <div className="w-3 h-3 rounded-full bg-[#febc2e] border border-black/10" />
                                     <div className="w-3 h-3 rounded-full bg-[#28c840] border border-black/10" />
                                 </div>
-                                <span className="text-[10px] font-black text-white/30 uppercase tracking-[0.2em]">Solution Insight</span>
+                                <span className="text-[10px] font-black text-white/30 uppercase tracking-[0.2em]">Solution Insight • {getProviderLabel()}</span>
                                 <div className="flex gap-2 no-drag">
                                     <button
                                         onClick={copyToClipboard}
@@ -538,7 +616,7 @@ const AssistantWidget: React.FC = () => {
                             <div className={`w-3 h-3 rounded-full transition-all duration-300 relative ${loading || analyzingDeep ? 'bg-yellow-400' : 'bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.6)]'}`}>
                                 <div className={`absolute inset-0 rounded-full animate-ping ${loading || analyzingDeep ? 'bg-yellow-400/40' : 'bg-green-500/40'}`} />
                             </div>
-                            <span className="text-white font-medium text-sm tracking-tight">{loading || analyzingDeep ? 'Analyzing...' : 'Online'}</span>
+                            <span className="text-white font-medium text-sm tracking-tight">{loading || analyzingDeep ? 'Analyzing...' : `${getProviderLabel()} Online`}</span>
                         </div>
                         <div className="w-[1px] h-6 bg-white/10" />
                         <button onClick={handleCapture} disabled={loading || analyzingDeep || followUpLoading} className="no-drag bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 text-white px-5 py-2 rounded-full text-xs font-bold transition-all shadow-lg active:translate-y-0.5">Quick Solve</button>
@@ -564,25 +642,114 @@ const AssistantWidget: React.FC = () => {
 
                             <div className="px-2 py-3 overflow-y-auto max-h-[62vh]">
                                 <form onSubmit={saveSettings} className="space-y-4">
+                                    {/* Provider Selector */}
                                     <div className="space-y-2">
-                                        <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Codex Model</label>
-                                        <div className="flex gap-2">
-                                            <input type="text" value={modelName} onChange={(e) => setModelName(e.target.value)} placeholder={DEFAULT_MODEL} className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-sm text-white w-full outline-none focus:border-blue-500/50" />
-                                            <button type="submit" className="no-drag bg-blue-600/30 hover:bg-blue-600/50 text-blue-200 px-3 py-2 rounded-xl text-xs font-bold transition-colors">Save</button>
+                                        <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">AI Provider</label>
+                                        <div className="grid grid-cols-3 gap-2">
+                                            <button
+                                                type="button"
+                                                onClick={() => setProvider('codex')}
+                                                className={`no-drag px-3 py-2 rounded-xl text-xs font-bold transition-all ${
+                                                    provider === 'codex'
+                                                        ? 'bg-blue-600 text-white'
+                                                        : 'bg-white/5 text-white/60 hover:bg-white/10'
+                                                }`}
+                                            >
+                                                Codex
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => setProvider('gemini')}
+                                                className={`no-drag px-3 py-2 rounded-xl text-xs font-bold transition-all ${
+                                                    provider === 'gemini'
+                                                        ? 'bg-blue-600 text-white'
+                                                        : 'bg-white/5 text-white/60 hover:bg-white/10'
+                                                }`}
+                                            >
+                                                Gemini
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => setProvider('kimi')}
+                                                className={`no-drag px-3 py-2 rounded-xl text-xs font-bold transition-all ${
+                                                    provider === 'kimi'
+                                                        ? 'bg-blue-600 text-white'
+                                                        : 'bg-white/5 text-white/60 hover:bg-white/10'
+                                                }`}
+                                            >
+                                                Kimi
+                                            </button>
                                         </div>
                                     </div>
+
+                                    {/* Model Input */}
+                                    <div className="space-y-2">
+                                        <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Model</label>
+                                        <input 
+                                            type="text" 
+                                            value={modelName} 
+                                            onChange={(e) => setModelName(e.target.value)} 
+                                            placeholder={getModelPlaceholder()} 
+                                            className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-sm text-white w-full outline-none focus:border-blue-500/50" 
+                                        />
+                                        <p className="text-[9px] text-white/30">
+                                            {provider === 'codex' && 'Default: gpt-5'}
+                                            {provider === 'gemini' && 'Default: gemini-2.0-flash'}
+                                            {provider === 'kimi' && 'Default: kimi-k2-0711-preview'}
+                                        </p>
+                                    </div>
+
+                                    {/* API Key Inputs - Show based on provider */}
+                                    {provider === 'gemini' && (
+                                        <div className="space-y-2">
+                                            <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Gemini API Key</label>
+                                            <input 
+                                                type="password" 
+                                                value={geminiApiKey} 
+                                                onChange={(e) => setGeminiApiKey(e.target.value)} 
+                                                placeholder="Enter your Gemini API key..."
+                                                className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-sm text-white w-full outline-none focus:border-blue-500/50" 
+                                            />
+                                            <p className="text-[9px] text-white/30">Get your key from <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline">Google AI Studio</a></p>
+                                        </div>
+                                    )}
+
+                                    {provider === 'kimi' && (
+                                        <div className="space-y-2">
+                                            <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Kimi API Key</label>
+                                            <input 
+                                                type="password" 
+                                                value={kimiApiKey} 
+                                                onChange={(e) => setKimiApiKey(e.target.value)} 
+                                                placeholder="Enter your Kimi API key..."
+                                                className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-sm text-white w-full outline-none focus:border-blue-500/50" 
+                                            />
+                                            <p className="text-[9px] text-white/30">Get your key from <a href="https://platform.moonshot.cn/console/api-keys" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline">Kimi Platform</a></p>
+                                        </div>
+                                    )}
+
                                     <div className="space-y-2">
                                         <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Session Context</label>
                                         <textarea
                                             value={sessionContext}
                                             onChange={(e) => setSessionContext(e.target.value)}
                                             placeholder="Optional context for this session..."
-                                            rows={4}
+                                            rows={3}
                                             className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-xs text-white w-full outline-none focus:border-blue-500/50 resize-none"
                                         />
                                         <p className="text-[9px] text-white/30 italic">Session context stays in memory only (not persisted).</p>
                                     </div>
-                                    <p className="text-[10px] text-white/25 italic text-center">Run `codex login` in your terminal before using the assistant.</p>
+
+                                    {provider === 'codex' && (
+                                        <p className="text-[10px] text-white/25 italic text-center">Run `codex login` in your terminal before using the assistant.</p>
+                                    )}
+
+                                    <button 
+                                        type="submit" 
+                                        className="no-drag w-full bg-blue-600/30 hover:bg-blue-600/50 text-blue-200 px-4 py-2.5 rounded-xl text-xs font-bold transition-colors"
+                                    >
+                                        Save Settings
+                                    </button>
                                 </form>
                             </div>
                         </div>

@@ -7,6 +7,7 @@ const allowedChannels = new Set([
     'open-screen-capture-settings',
     'analyze-screen-deep',
     'solve-with-codex',
+    'solve-with-ai',
 ])
 
 function ensureAllowed(channel: string) {
