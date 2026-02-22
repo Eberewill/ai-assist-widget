@@ -696,7 +696,6 @@ async function solveWithAI(request: SolveRequest) {
 function registerIpcHandlers() {
     ipcMain.removeHandler('capture-screen')
     ipcMain.removeHandler('resize-window')
-    ipcMain.removeHandler('set-focusable')
     ipcMain.removeHandler('open-screen-capture-settings')
     ipcMain.removeHandler('analyze-screen-deep')
     ipcMain.removeHandler('solve-with-codex')
@@ -746,13 +745,6 @@ function registerIpcHandlers() {
         setWindowSize(width || WINDOW_DEFAULT_WIDTH, height || WINDOW_MIN_HEIGHT)
     })
 
-    ipcMain.handle('set-focusable', (_event, { focusable }) => {
-        if (win) {
-            win.setIgnoreMouseEvents(!focusable, { forward: true })
-            win.setFocusable(focusable)
-        }
-    })
-
     ipcMain.handle('open-screen-capture-settings', () => {
         if (process.platform === 'darwin') {
             shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture')
@@ -770,8 +762,9 @@ function createWindow() {
         alwaysOnTop: true,
         skipTaskbar: true,
         resizable: false,
-        focusable: true,
+        focusable: false,        // Never steal focus from other windows
         hasShadow: false,
+        type: 'panel',           // Use panel type for stealth behavior
         webPreferences: {
             preload: preloadPath,
             nodeIntegration: false,
@@ -784,7 +777,29 @@ function createWindow() {
         win.setWindowButtonVisibility(false)
         win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
         win.setContentProtection(true)
+        // Make window ignore focus entirely - stay on top without activating
+        win.setAlwaysOnTop(true, 'screen-saver', 1)
+        // Prevent the window from becoming the key window
+        win.setFullScreenable(false)
     }
+
+    // Prevent the window from taking focus on click
+    win.setIgnoreMouseEvents(false)
+    
+    // Handle focus-stealing prevention
+    win.on('focus', () => {
+        // Immediately blur the window if it somehow gets focus
+        if (win) {
+            win.blur()
+        }
+    })
+
+    // Prevent window from activating on show
+    win.on('show', () => {
+        if (win && process.platform === 'darwin') {
+            win.setAlwaysOnTop(true, 'screen-saver', 1)
+        }
+    })
 
     if (process.env.VITE_DEV_SERVER_URL) {
         win.loadURL(process.env.VITE_DEV_SERVER_URL)

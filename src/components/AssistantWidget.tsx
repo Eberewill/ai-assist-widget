@@ -190,17 +190,6 @@ const AssistantWidget: React.FC = () => {
         })
     }, [response, messages.length, showSettings, isCollapsed])
 
-    useEffect(() => {
-        const ipc = getIpcBridge()
-        if (!ipc?.invoke) {
-            return
-        }
-
-        ipc.invoke('set-focusable', { focusable: true }).catch((error: unknown) => {
-            console.warn('[RENDERER] Interaction toggle failed:', error)
-        })
-    }, [showSettings, isCollapsed])
-
     const runAISolve = async (request: SolveRequest) => {
         const ipc = getIpcBridge()
         if (!ipc?.invoke) {

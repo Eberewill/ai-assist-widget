@@ -3,7 +3,6 @@ import { contextBridge, ipcRenderer } from 'electron'
 const allowedChannels = new Set([
     'capture-screen',
     'resize-window',
-    'set-focusable',
     'open-screen-capture-settings',
     'analyze-screen-deep',
     'solve-with-codex',
