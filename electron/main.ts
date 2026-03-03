@@ -37,8 +37,9 @@ const PYTHON_COMMAND_CANDIDATES = Array.from(
 ) as string[]
 
 const CODEX_COMMAND_CANDIDATES = Array.from(new Set([process.env.CODEX_PATH, 'codex'].filter(Boolean))) as string[]
+const KIMI_COMMAND_CANDIDATES = Array.from(new Set([process.env.KIMI_PATH, 'kimi'].filter(Boolean))) as string[]
 
-type AIProvider = 'codex' | 'gemini' | 'kimi'
+type AIProvider = 'codex' | 'gemini' | 'kimi' | 'kimi-code'
 
 type ChatRole = 'user' | 'assistant'
 
@@ -331,6 +332,21 @@ function normalizeBase64(raw: string) {
     return raw
 }
 
+function resolveCodexModel(requestedModel?: string) {
+    const trimmed = requestedModel?.trim()
+    if (!trimmed) {
+        return CODEX_DEFAULT_MODEL
+    }
+
+    const normalized = trimmed.toLowerCase()
+    if (normalized.startsWith('gemini') || normalized.startsWith('kimi')) {
+        console.warn(`[MAIN] Ignoring incompatible Codex model "${trimmed}". Falling back to ${CODEX_DEFAULT_MODEL}.`)
+        return CODEX_DEFAULT_MODEL
+    }
+
+    return trimmed
+}
+
 function truncateForPrompt(value: string, maxLength: number) {
     if (value.length <= maxLength) {
         return value
@@ -442,7 +458,7 @@ async function runCodexWithFallback(args: string[]) {
 
 async function solveWithCodex(request: SolveRequest) {
     const prompt = buildAIPrompt(request)
-    const model = request.model?.trim() || CODEX_DEFAULT_MODEL
+    const model = resolveCodexModel(request.model)
 
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-assist-codex-'))
     const outputPath = path.join(tempDir, 'last-message.txt')
@@ -508,6 +524,88 @@ async function solveWithCodex(request: SolveRequest) {
     } finally {
         fs.rmSync(tempDir, { recursive: true, force: true })
     }
+}
+
+// ===== Kimi Code CLI Implementation =====
+
+type KimiCommandResult = {
+    stdout: string
+    stderr: string
+}
+
+function runKimiCommand(kimiCommand: string, args: string[]) {
+    return new Promise<KimiCommandResult>((resolve, reject) => {
+        execFile(
+            kimiCommand,
+            args,
+            {
+                cwd: process.cwd(),
+                env: process.env,
+                timeout: 120000,
+                maxBuffer: 20 * 1024 * 1024,
+            },
+            (error, stdout, stderr) => {
+                const stdoutText = stdout?.toString() || ''
+                const stderrText = stderr?.toString() || ''
+                if (error) {
+                    const err = error as NodeJS.ErrnoException
+                    if (err.code === 'ENOENT') {
+                        reject(err)
+                        return
+                    }
+                    reject(new Error(stderrText.trim() || error.message))
+                    return
+                }
+                resolve({ stdout: stdoutText, stderr: stderrText })
+            },
+        )
+    })
+}
+
+async function runKimiWithFallback(args: string[]) {
+    let lastError: Error | null = null
+
+    for (const kimiCommand of KIMI_COMMAND_CANDIDATES) {
+        try {
+            return await runKimiCommand(kimiCommand, args)
+        } catch (error) {
+            const candidateError = error as NodeJS.ErrnoException
+            if (candidateError.code === 'ENOENT') {
+                lastError = candidateError
+                continue
+            }
+            throw error
+        }
+    }
+
+    throw lastError || new Error('Kimi CLI not found. Install with: uv tool install kimi-cli')
+}
+
+async function solveWithKimiCode(request: SolveRequest) {
+    const prompt = buildAIPrompt(request)
+    const model = request.model?.trim() || 'kimi-k2.5'
+
+    // Kimi CLI uses --prompt flag and runs non-interactively with --yolo
+    const args = [
+        '--yolo',           // Auto-approve actions (non-interactive)
+        '--max-steps-per-turn', '1',  // Single step only
+        '--model', model,
+        '--prompt', prompt,
+    ]
+
+    const commandResult = await runKimiWithFallback(args)
+    const response = commandResult.stdout.trim()
+
+    if (!response) {
+        const stderrTail = commandResult.stderr.trim().split('\n').slice(-8).join('\n')
+        throw new Error(
+            stderrTail
+                ? `Kimi CLI returned an empty response. CLI stderr:\n${stderrTail}`
+                : 'Kimi CLI returned an empty response.',
+        )
+    }
+
+    return response
 }
 
 // ===== Gemini Implementation =====
@@ -608,9 +706,6 @@ async function solveWithKimi(request: SolveRequest) {
         throw new Error('Kimi API key is required. Please add your API key in settings.')
     }
 
-    // Log key info for debugging (mask the actual key)
-    console.log('[MAIN] Kimi API Key present:', apiKey ? `Yes (${apiKey.length} chars, starts with ${apiKey.slice(0, 4)}...)` : 'No')
-
     const model = request.model?.trim() || KIMI_DEFAULT_MODEL
     const prompt = buildAIPrompt(request)
 
@@ -674,7 +769,6 @@ async function solveWithKimi(request: SolveRequest) {
             },
             (res) => {
                 let data = ''
-                console.log('[MAIN] Kimi API response status:', res.statusCode)
                 res.on('data', (chunk) => {
                     data += chunk
                 })
@@ -682,7 +776,6 @@ async function solveWithKimi(request: SolveRequest) {
                     try {
                         const response = JSON.parse(data)
                         if (response.error) {
-                            console.error('[MAIN] Kimi API error response:', JSON.stringify(response.error))
                             reject(new Error(`Kimi API error: ${response.error.message || JSON.stringify(response.error)}`))
                             return
                         }
@@ -693,7 +786,6 @@ async function solveWithKimi(request: SolveRequest) {
                         }
                         resolve(text)
                     } catch (parseError) {
-                        console.error('[MAIN] Kimi raw response:', data)
                         reject(new Error(`Failed to parse Kimi response: ${(parseError as Error).message}`))
                     }
                 })
@@ -724,6 +816,8 @@ async function solveWithAI(request: SolveRequest) {
             return solveWithGemini(request)
         case 'kimi':
             return solveWithKimi(request)
+        case 'kimi-code':
+            return solveWithKimiCode(request)
         case 'codex':
         default:
             return solveWithCodex(request)
@@ -773,8 +867,19 @@ function registerIpcHandlers() {
     // New unified AI handler with Ghost Mode support
     ipcMain.handle('solve-with-ai', async (_event, request: SolveRequest) => {
         try {
-            // If ghost mode is enabled, automatically get selected text
-            if (request.ghostMode) {
+            // Kimi Code doesn't support images, so we always use ghost mode (selected text)
+            if (request.provider === 'kimi-code') {
+                try {
+                    const selectedResult = await getSelectedText()
+                    if (selectedResult.success && selectedResult.text) {
+                        request.selectedText = selectedResult.text
+                    }
+                } catch (ghostError) {
+                    console.warn('[MAIN] Kimi Code failed to get selected text:', ghostError)
+                }
+            }
+            // If ghost mode is enabled for other providers, get selected text
+            else if (request.ghostMode) {
                 try {
                     const selectedResult = await getSelectedText()
                     if (selectedResult.success && selectedResult.text) {

@@ -33,7 +33,43 @@ type MessagePart = {
     language?: string
 }
 
-type AIProvider = 'codex' | 'gemini' | 'kimi'
+type AIProvider = 'codex' | 'gemini' | 'kimi' | 'kimi-code'
+
+const MODEL_STORAGE_BY_PROVIDER: Record<AIProvider, string> = {
+    codex: 'ai_model_codex',
+    gemini: 'ai_model_gemini',
+    kimi: 'ai_model_kimi',
+    'kimi-code': 'ai_model_kimi_code',
+}
+
+function getDefaultModelForProvider(provider: AIProvider) {
+    switch (provider) {
+        case 'gemini':
+            return DEFAULT_GEMINI_MODEL
+        case 'kimi':
+        case 'kimi-code':
+            return DEFAULT_KIMI_MODEL
+        case 'codex':
+        default:
+            return DEFAULT_MODEL
+    }
+}
+
+function isModelCompatibleWithProvider(provider: AIProvider, model: string) {
+    const normalized = model.trim().toLowerCase()
+    if (!normalized) return false
+
+    if (provider === 'gemini') {
+        return normalized.startsWith('gemini')
+    }
+
+    if (provider === 'kimi' || provider === 'kimi-code') {
+        return normalized.startsWith('kimi')
+    }
+
+    // Codex provider should avoid obvious cross-provider models.
+    return !normalized.startsWith('gemini') && !normalized.startsWith('kimi')
+}
 
 type IpcRendererBridge = {
     invoke(channel: string, ...args: unknown[]): Promise<unknown>
@@ -146,10 +182,23 @@ const AssistantWidget: React.FC = () => {
     const [sessionContext, setSessionContext] = useState('')
 
     // Provider and API settings
-    const [provider, setProvider] = useState<AIProvider>(
-        (localStorage.getItem('ai_provider') as AIProvider) || 'codex'
-    )
-    const [modelName, setModelName] = useState(localStorage.getItem('ai_model') || DEFAULT_MODEL)
+    const [provider, setProvider] = useState<AIProvider>(() => {
+        return (localStorage.getItem('ai_provider') as AIProvider) || 'codex'
+    })
+    const [modelName, setModelName] = useState(() => {
+        const initialProvider = (localStorage.getItem('ai_provider') as AIProvider) || 'codex'
+        const providerSpecificModel = localStorage.getItem(MODEL_STORAGE_BY_PROVIDER[initialProvider])?.trim()
+        if (providerSpecificModel) {
+            return providerSpecificModel
+        }
+
+        const legacyModel = localStorage.getItem('ai_model')?.trim() || ''
+        if (legacyModel && isModelCompatibleWithProvider(initialProvider, legacyModel)) {
+            return legacyModel
+        }
+
+        return getDefaultModelForProvider(initialProvider)
+    })
     const [geminiApiKey, setGeminiApiKey] = useState(localStorage.getItem('gemini_api_key') || '')
     const [kimiApiKey, setKimiApiKey] = useState(localStorage.getItem('kimi_api_key') || '')
     const [ghostMode, setGhostMode] = useState(localStorage.getItem('ghost_mode') === 'true')
@@ -158,21 +207,15 @@ const AssistantWidget: React.FC = () => {
     const followUpImageInputRef = useRef<HTMLInputElement | null>(null)
 
     useEffect(() => {
-        // Update model when provider changes to appropriate default
-        const savedModel = localStorage.getItem('ai_model')
-        if (!savedModel) {
-            switch (provider) {
-                case 'gemini':
-                    setModelName(DEFAULT_GEMINI_MODEL)
-                    break
-                case 'kimi':
-                    setModelName(DEFAULT_KIMI_MODEL)
-                    break
-                default:
-                    setModelName(DEFAULT_MODEL)
-            }
+        const providerSpecificModel = localStorage.getItem(MODEL_STORAGE_BY_PROVIDER[provider])?.trim()
+        if (providerSpecificModel) {
+            setModelName(providerSpecificModel)
+            return
         }
+        setModelName(getDefaultModelForProvider(provider))
     }, [provider])
+
+    const getSelectedModel = () => modelName.trim() || getDefaultModelForProvider(provider)
 
     useEffect(() => {
         const ipc = getIpcBridge()
@@ -239,10 +282,7 @@ const AssistantWidget: React.FC = () => {
             return
         }
 
-        const selectedModel = modelName.trim() || (
-            provider === 'gemini' ? DEFAULT_GEMINI_MODEL :
-            provider === 'kimi' ? DEFAULT_KIMI_MODEL : DEFAULT_MODEL
-        )
+        const selectedModel = getSelectedModel()
 
         setLoading(true)
         setResponse(null)
@@ -252,9 +292,13 @@ const AssistantWidget: React.FC = () => {
         setFollowUpImage(null)
 
         try {
-            const captureData = await ipc.invoke('capture-screen')
-            if (typeof captureData !== 'string' || !captureData) {
-                throw new Error('No image data received from capture-screen')
+            // Kimi Code doesn't support images, skip screen capture and use text-only
+            let captureData: string | undefined
+            if (provider !== 'kimi-code') {
+                captureData = await ipc.invoke('capture-screen') as string
+                if (typeof captureData !== 'string' || !captureData) {
+                    throw new Error('No image data received from capture-screen')
+                }
             }
 
             const fullText = await runAISolve({
@@ -263,7 +307,7 @@ const AssistantWidget: React.FC = () => {
                 apiKey: getApiKey(),
                 prompt: buildQuickSolvePrompt(sessionContext),
                 imageBase64: captureData,
-                imageMimeType: 'image/png',
+                imageMimeType: captureData ? 'image/png' : undefined,
                 ghostMode,
             })
 
@@ -298,10 +342,7 @@ const AssistantWidget: React.FC = () => {
             return
         }
 
-        const selectedModel = modelName.trim() || (
-            provider === 'gemini' ? DEFAULT_GEMINI_MODEL :
-            provider === 'kimi' ? DEFAULT_KIMI_MODEL : DEFAULT_MODEL
-        )
+        const selectedModel = getSelectedModel()
 
         setAnalyzingDeep(true)
         setResponse(null)
@@ -365,10 +406,7 @@ const AssistantWidget: React.FC = () => {
             return
         }
 
-        const selectedModel = modelName.trim() || (
-            provider === 'gemini' ? DEFAULT_GEMINI_MODEL :
-            provider === 'kimi' ? DEFAULT_KIMI_MODEL : DEFAULT_MODEL
-        )
+        const selectedModel = getSelectedModel()
         const userText = trimmed || '[Attached image for follow-up]'
 
         const userMessage: ChatMessage = {
@@ -465,12 +503,10 @@ const AssistantWidget: React.FC = () => {
 
     const saveSettings = (e: React.FormEvent) => {
         e.preventDefault()
-        const nextModel = modelName.trim() || (
-            provider === 'gemini' ? DEFAULT_GEMINI_MODEL :
-            provider === 'kimi' ? DEFAULT_KIMI_MODEL : DEFAULT_MODEL
-        )
+        const nextModel = getSelectedModel()
         localStorage.setItem('ai_provider', provider)
         localStorage.setItem('ai_model', nextModel)
+        localStorage.setItem(MODEL_STORAGE_BY_PROVIDER[provider], nextModel)
         localStorage.setItem('gemini_api_key', geminiApiKey)
         localStorage.setItem('kimi_api_key', kimiApiKey)
         localStorage.setItem('ghost_mode', String(ghostMode))
@@ -497,6 +533,9 @@ const AssistantWidget: React.FC = () => {
             case 'kimi':
                 label = 'Kimi'
                 break
+            case 'kimi-code':
+                label = 'Kimi Code'
+                break
         }
         const modes = []
         if (ghostMode) modes.push('Ghost')
@@ -504,7 +543,7 @@ const AssistantWidget: React.FC = () => {
         return modes.length > 0 ? `${label} • ${modes.join('+')}` : label
     }
 
-    const modelPlaceholder = provider === 'gemini' ? DEFAULT_GEMINI_MODEL : provider === 'kimi' ? DEFAULT_KIMI_MODEL : DEFAULT_MODEL
+    const modelPlaceholder = getDefaultModelForProvider(provider)
     // Use modelPlaceholder to avoid TypeScript unused variable warning
     void modelPlaceholder
 
@@ -632,7 +671,7 @@ const AssistantWidget: React.FC = () => {
                             <span className="text-white font-medium text-sm tracking-tight">{loading || analyzingDeep ? 'Analyzing...' : `${getProviderLabel()} Online`}</span>
                         </div>
                         <div className="w-[1px] h-6 bg-white/10" />
-                        <button onClick={handleCapture} disabled={loading || analyzingDeep || followUpLoading} className="no-drag bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 text-white px-5 py-2 rounded-full text-xs font-bold transition-all shadow-lg active:translate-y-0.5">Quick Solve</button>
+                        <button onClick={handleCapture} disabled={loading || analyzingDeep || followUpLoading} className="no-drag bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 text-white px-5 py-2 rounded-full text-xs font-bold transition-all shadow-lg active:translate-y-0.5">{provider === 'kimi-code' ? 'Solve Text' : 'Quick Solve'}</button>
                         <button onClick={handleDeepAnalysis} disabled={loading || analyzingDeep || followUpLoading} className={`no-drag px-5 py-2 rounded-full text-xs font-bold transition-all border ${analyzingDeep ? 'bg-indigo-600/20 border-indigo-500/50 text-indigo-200' : 'bg-transparent border-white/20 hover:border-white/40 text-white/80'}`}>{analyzingDeep ? 'Analyzing...' : 'Deep Analysis'}</button>
                         <button onClick={() => setShowSettings(!showSettings)} className="no-drag text-white/40 hover:text-white/100 transition-colors"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l-.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.1a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" /><circle cx="12" cy="12" r="3" /></svg></button>
                         <button onClick={() => { setShowSettings(false); setIsCollapsed(true) }} className="no-drag text-white/40 hover:text-white/100 transition-colors text-xs">Hide</button>
@@ -658,11 +697,11 @@ const AssistantWidget: React.FC = () => {
                                     {/* Provider Selector */}
                                     <div className="space-y-2">
                                         <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">AI Provider</label>
-                                        <div className="grid grid-cols-3 gap-2">
+                                        <div className="grid grid-cols-4 gap-2">
                                             <button
                                                 type="button"
                                                 onClick={() => setProvider('codex')}
-                                                className={`no-drag px-3 py-2 rounded-xl text-xs font-bold transition-all ${
+                                                className={`no-drag px-2 py-2 rounded-xl text-xs font-bold transition-all ${
                                                     provider === 'codex'
                                                         ? 'bg-blue-600 text-white'
                                                         : 'bg-white/5 text-white/60 hover:bg-white/10'
@@ -673,7 +712,7 @@ const AssistantWidget: React.FC = () => {
                                             <button
                                                 type="button"
                                                 onClick={() => setProvider('gemini')}
-                                                className={`no-drag px-3 py-2 rounded-xl text-xs font-bold transition-all ${
+                                                className={`no-drag px-2 py-2 rounded-xl text-xs font-bold transition-all ${
                                                     provider === 'gemini'
                                                         ? 'bg-blue-600 text-white'
                                                         : 'bg-white/5 text-white/60 hover:bg-white/10'
@@ -684,13 +723,24 @@ const AssistantWidget: React.FC = () => {
                                             <button
                                                 type="button"
                                                 onClick={() => setProvider('kimi')}
-                                                className={`no-drag px-3 py-2 rounded-xl text-xs font-bold transition-all ${
+                                                className={`no-drag px-2 py-2 rounded-xl text-xs font-bold transition-all ${
                                                     provider === 'kimi'
                                                         ? 'bg-blue-600 text-white'
                                                         : 'bg-white/5 text-white/60 hover:bg-white/10'
                                                 }`}
                                             >
                                                 Kimi
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => setProvider('kimi-code')}
+                                                className={`no-drag px-2 py-2 rounded-xl text-xs font-bold transition-all ${
+                                                    provider === 'kimi-code'
+                                                        ? 'bg-purple-600 text-white'
+                                                        : 'bg-white/5 text-white/60 hover:bg-white/10'
+                                                }`}
+                                            >
+                                                Kimi Code
                                             </button>
                                         </div>
                                     </div>
@@ -750,7 +800,7 @@ const AssistantWidget: React.FC = () => {
                                         )}
                                     </div>
 
-                                    {/* Model Input --}
+                                    {/* Model Input */}
                                     <div className="space-y-2">
                                         <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Model</label>
                                         <input 
@@ -763,7 +813,7 @@ const AssistantWidget: React.FC = () => {
                                         <p className="text-[9px] text-white/30">
                                             {provider === 'codex' && 'Default: gpt-5'}
                                             {provider === 'gemini' && 'Default: gemini-2.0-flash'}
-                                            {provider === 'kimi' && 'Default: kimi-k2.5'}
+                                            {(provider === 'kimi' || provider === 'kimi-code') && 'Default: kimi-k2.5'}
                                         </p>
                                     </div>
 
@@ -793,6 +843,20 @@ const AssistantWidget: React.FC = () => {
                                                 className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-sm text-white w-full outline-none focus:border-blue-500/50" 
                                             />
                                             <p className="text-[9px] text-white/30">Get your key from <a href="https://platform.moonshot.cn/console/api-keys" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline">Kimi Platform</a></p>
+                                        </div>
+                                    )}
+
+                                    {provider === 'kimi-code' && (
+                                        <div className="space-y-2">
+                                            <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Kimi Code CLI</label>
+                                            <div className="bg-purple-500/10 border border-purple-500/20 rounded-xl px-3 py-2">
+                                                <p className="text-xs text-white/70">Uses your Kimi Code CLI authentication.</p>
+                                                <p className="text-[9px] text-white/40 mt-1">Run <code className="bg-black/30 px-1 rounded">kimi /login</code> in terminal to authenticate.</p>
+                                            </div>
+                                            <div className="bg-blue-500/10 border border-blue-500/20 rounded-xl px-3 py-2">
+                                                <p className="text-xs text-blue-200">📋 Uses Ghost Mode: Automatically captures selected text instead of screenshots.</p>
+                                            </div>
+                                            <p className="text-[9px] text-white/30">Install with: <code className="text-purple-300">uv tool install kimi-cli</code></p>
                                         </div>
                                     )}
 
