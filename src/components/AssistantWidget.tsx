@@ -1,15 +1,18 @@
-import React, { useState, useEffect, useRef } from 'react'
-import { GoogleGenerativeAI } from '@google/generative-ai'
+import React, { useEffect, useRef, useState } from 'react'
 
 const COLLAPSED_HEIGHT = 120
-const SETTINGS_HEIGHT = 360
+const SETTINGS_HEIGHT = 520
 const RESPONSE_HEIGHT = 560
 const COLLAPSED_WIDTH = 120
 const EXPANDED_WIDTH = 960
-const DEFAULT_MODEL = 'gemini-2.0-flash'
+const DEFAULT_MODEL = 'gpt-5'
+const DEFAULT_GEMINI_MODEL = 'gemini-2.0-flash'
+const DEFAULT_KIMI_MODEL = 'kimi-k2.5'
+
+type ChatRole = 'user' | 'assistant'
 
 type ChatMessage = {
-    role: 'user' | 'assistant'
+    role: ChatRole
     text: string
     image?: {
         dataUrl: string
@@ -28,6 +31,68 @@ type MessagePart = {
     type: 'text' | 'code'
     content: string
     language?: string
+}
+
+type AIProvider = 'codex' | 'gemini' | 'kimi' | 'kimi-code'
+
+const MODEL_STORAGE_BY_PROVIDER: Record<AIProvider, string> = {
+    codex: 'ai_model_codex',
+    gemini: 'ai_model_gemini',
+    kimi: 'ai_model_kimi',
+    'kimi-code': 'ai_model_kimi_code',
+}
+
+function getDefaultModelForProvider(provider: AIProvider) {
+    switch (provider) {
+        case 'gemini':
+            return DEFAULT_GEMINI_MODEL
+        case 'kimi':
+        case 'kimi-code':
+            return DEFAULT_KIMI_MODEL
+        case 'codex':
+        default:
+            return DEFAULT_MODEL
+    }
+}
+
+function isModelCompatibleWithProvider(provider: AIProvider, model: string) {
+    const normalized = model.trim().toLowerCase()
+    if (!normalized) return false
+
+    if (provider === 'gemini') {
+        return normalized.startsWith('gemini')
+    }
+
+    if (provider === 'kimi' || provider === 'kimi-code') {
+        return normalized.startsWith('kimi')
+    }
+
+    // Codex provider should avoid obvious cross-provider models.
+    return !normalized.startsWith('gemini') && !normalized.startsWith('kimi')
+}
+
+type IpcRendererBridge = {
+    invoke(channel: string, ...args: unknown[]): Promise<unknown>
+}
+
+type SolveRequest = {
+    prompt: string
+    model: string
+    provider: AIProvider
+    apiKey?: string
+    imageBase64?: string
+    imageMimeType?: string
+    semanticStructure?: unknown
+    messages?: Array<{
+        role: ChatRole
+        text: string
+    }>
+    ghostMode?: boolean
+}
+
+function getIpcBridge() {
+    const win = window as Window & { ipcRenderer?: IpcRendererBridge }
+    return win.ipcRenderer ?? null
 }
 
 function splitMessageParts(text: string): MessagePart[] {
@@ -60,21 +125,44 @@ function splitMessageParts(text: string): MessagePart[] {
     return parts.length ? parts : [{ type: 'text', content: text }]
 }
 
-function readBlobAsDataUrl(blob: Blob): Promise<string> {
-    return new Promise((resolve, reject) => {
-        const reader = new FileReader()
-        reader.onload = () => {
-            if (typeof reader.result === 'string') {
-                resolve(reader.result)
-            } else {
-                reject(new Error('Failed to parse audio data'))
-            }
-        }
-        reader.onerror = () => {
-            reject(reader.error ?? new Error('Error reading audio blob'))
-        }
-        reader.readAsDataURL(blob)
-    })
+function processResponse(fullText: string) {
+    const lines = fullText.split('\n')
+    const suggestions = lines
+        .filter((line) => line.trim().startsWith('Suggestion:'))
+        .map((line) => line.replace('Suggestion:', '').trim())
+        .filter(Boolean)
+
+    const cleanText = lines
+        .filter((line) => !line.trim().startsWith('Suggestion:'))
+        .join('\n')
+        .trim()
+
+    return { cleanText, suggestions }
+}
+
+function buildQuickSolvePrompt(sessionContext: string) {
+    return `You are a professional on-screen coding assistant.
+1. Analyze the provided screenshot.
+2. If you see code, a technical problem, or a question, solve it concisely.
+3. Provide only the solution (code or answer), no filler.
+4. If multiple tasks exist, solve the most visible one.
+${sessionContext ? `\nSession Context:\n${sessionContext}` : ''}`
+}
+
+function buildDeepSolvePrompt(sessionContext: string) {
+    return `You are a precision macOS assistant.
+You will receive a screenshot and semantic structure JSON from the active window.
+Use both to solve the user's visible technical task with exact UI/code references where possible.
+Provide a concise, professional solution.
+${sessionContext ? `\nSession Context:\n${sessionContext}` : ''}`
+}
+
+function buildFollowUpPrompt(userPrompt: string, sessionContext: string) {
+    const basePrompt = userPrompt || 'Analyze the attached image and continue helping with the same task.'
+    if (!sessionContext) {
+        return basePrompt
+    }
+    return `${basePrompt}\n\nSession Context:\n${sessionContext}`
 }
 
 const AssistantWidget: React.FC = () => {
@@ -82,280 +170,119 @@ const AssistantWidget: React.FC = () => {
     const [analyzingDeep, setAnalyzingDeep] = useState(false)
     const [response, setResponse] = useState<string | null>(null)
     const [messages, setMessages] = useState<ChatMessage[]>([])
-    const [apiKey, setApiKey] = useState(localStorage.getItem('gemini_api_key') || '')
-    const [modelName, setModelName] = useState(localStorage.getItem('gemini_model') || DEFAULT_MODEL)
-    const [showSettings, setShowSettings] = useState(!apiKey)
+    const [showSettings, setShowSettings] = useState(false)
     const [copied, setCopied] = useState(false)
     const [isCollapsed, setIsCollapsed] = useState(false)
     const [needsScreenPermission, setNeedsScreenPermission] = useState(false)
-    const [listingModels, setListingModels] = useState(false)
     const [followUp, setFollowUp] = useState('')
     const [followUpImage, setFollowUpImage] = useState<FollowUpImage | null>(null)
     const [followUpLoading, setFollowUpLoading] = useState(false)
     const [copiedCodeId, setCopiedCodeId] = useState<string | null>(null)
-    const [isRecording, setIsRecording] = useState(false)
-    const [interviewMode, setInterviewMode] = useState(false)
-    const [interviewContext, setInterviewContext] = useState(localStorage.getItem('gemini_interview_context') || '')
-    const [isStreaming, setIsStreaming] = useState(false)
-    const [streamedResponse, setStreamedResponse] = useState('')
-
-    const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-    const audioContextRef = useRef<AudioContext | null>(null)
-    const analyserRef = useRef<AnalyserNode | null>(null)
-    const streamRef = useRef<MediaStream | null>(null)
     const [recommendations, setRecommendations] = useState<string[]>([])
-    const apiKeyInputRef = useRef<HTMLInputElement | null>(null)
+    const [sessionContext, setSessionContext] = useState('')
+
+    // Provider and API settings
+    const [provider, setProvider] = useState<AIProvider>(() => {
+        return (localStorage.getItem('ai_provider') as AIProvider) || 'codex'
+    })
+    const [modelName, setModelName] = useState(() => {
+        const initialProvider = (localStorage.getItem('ai_provider') as AIProvider) || 'codex'
+        const providerSpecificModel = localStorage.getItem(MODEL_STORAGE_BY_PROVIDER[initialProvider])?.trim()
+        if (providerSpecificModel) {
+            return providerSpecificModel
+        }
+
+        const legacyModel = localStorage.getItem('ai_model')?.trim() || ''
+        if (legacyModel && isModelCompatibleWithProvider(initialProvider, legacyModel)) {
+            return legacyModel
+        }
+
+        return getDefaultModelForProvider(initialProvider)
+    })
+    const [geminiApiKey, setGeminiApiKey] = useState(localStorage.getItem('gemini_api_key') || '')
+    const [kimiApiKey, setKimiApiKey] = useState(localStorage.getItem('kimi_api_key') || '')
+    const [ghostMode, setGhostMode] = useState(localStorage.getItem('ghost_mode') === 'true')
+    const [stealthMode, setStealthMode] = useState(localStorage.getItem('stealth_mode') !== 'false') // Default ON
+
     const followUpImageInputRef = useRef<HTMLInputElement | null>(null)
-    const chatSessionRef = useRef<any>(null)
 
-    const processResponse = (fullText: string) => {
-        const lines = fullText.split('\n')
-        const suggestions = lines
-            .filter(l => l.startsWith('Suggestion:'))
-            .map(l => l.replace('Suggestion:', '').trim())
-
-        const cleanText = lines
-            .filter(l => !l.startsWith('Suggestion:'))
-            .join('\n')
-            .trim()
-
-        return { cleanText, suggestions }
-    }
-
-    const toggleRecording = async () => {
-        if (isRecording) {
-            mediaRecorderRef.current?.stop()
-            setIsRecording(false)
+    useEffect(() => {
+        const providerSpecificModel = localStorage.getItem(MODEL_STORAGE_BY_PROVIDER[provider])?.trim()
+        if (providerSpecificModel) {
+            setModelName(providerSpecificModel)
             return
         }
+        setModelName(getDefaultModelForProvider(provider))
+    }, [provider])
 
-        try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-            const recorder = new MediaRecorder(stream)
-            const chunks: Blob[] = []
-
-            recorder.ondataavailable = (e) => {
-                if (e.data.size > 0) chunks.push(e.data)
-            }
-
-            recorder.onstop = async () => {
-                const audioBlob = new Blob(chunks, { type: 'audio/webm' })
-                await processAudio(audioBlob)
-                stream.getTracks().forEach(track => track.stop())
-            }
-
-            mediaRecorderRef.current = recorder
-            recorder.start()
-            setIsRecording(true)
-        } catch (error) {
-            console.error('[RENDERER] Mic access failed:', error)
-            setResponse('Microphone access denied or not found.')
-        }
-    }
-
-    const processAudio = async (blob: Blob) => {
-        setLoading(true)
-        setIsStreaming(interviewMode)
-        setStreamedResponse('')
-
-        try {
-            const dataUrl = await readBlobAsDataUrl(blob)
-            const [, base64Audio] = dataUrl.split(',')
-            if (!base64Audio) {
-                throw new Error('Audio conversion failed')
-            }
-            const genAI = new GoogleGenerativeAI(apiKey)
-            const model = genAI.getGenerativeModel({ model: modelName || DEFAULT_MODEL })
-
-            const contextSuffix = interviewContext ? `\n\nINTERVIEW CONTEXT (User's Resume/Job Description):\n${interviewContext}` : ''
-            const prompt = `Listen to the audio and answer the user's question directly and concisely. 
-DO NOT transcribe what the user said. DO NOT start with "You said" or "I heard". 
-Just provide the best possible answer or solution to their query as if having a normal conversation in a technical interview setting.
-${contextSuffix}
-
-Also, provide 3 short logical follow-up actions (max 6 words each) at the end, each on a new line starting with 'Suggestion: '.`
-
-            if (interviewMode) {
-                const result = await model.generateContentStream([
-                    { inlineData: { data: base64Audio, mimeType: 'audio/webm' } },
-                    prompt,
-                ])
-
-                let fullText = ''
-                for await (const chunk of result.stream) {
-                    const chunkText = chunk.text()
-                    fullText += chunkText
-                    setStreamedResponse(fullText)
-                }
-
-                const { cleanText, suggestions } = processResponse(fullText)
-                setMessages((prev) => [...prev, { role: 'assistant', text: cleanText }])
-                setRecommendations(suggestions)
-                setIsStreaming(false)
-                setStreamedResponse('')
-            } else {
-                const result = await model.generateContent([
-                    { inlineData: { data: base64Audio, mimeType: 'audio/webm' } },
-                    prompt,
-                ])
-                const fullText = result.response.text().trim()
-                const { cleanText, suggestions } = processResponse(fullText)
-                setMessages([{ role: 'assistant', text: cleanText }])
-                setRecommendations(suggestions)
-            }
-        } catch (error) {
-            console.error('[RENDERER] Audio processing failed:', error)
-            setResponse(`Audio Error: ${error instanceof Error ? error.message : String(error)}`)
-        } finally {
-            setLoading(false)
-            if (interviewMode) {
-                setIsStreaming(false)
-                setStreamedResponse('')
-            }
-        }
-    }
+    const getSelectedModel = () => modelName.trim() || getDefaultModelForProvider(provider)
 
     useEffect(() => {
-        if (interviewMode) {
-            startContinuousListening()
-        } else {
-            stopContinuousListening()
-        }
-        return () => stopContinuousListening()
-    }, [interviewMode])
-
-    const startContinuousListening = async () => {
-        try {
-            const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-            streamRef.current = stream
-
-            const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)()
-            audioContextRef.current = audioContext
-
-            const analyser = audioContext.createAnalyser()
-            analyser.fftSize = 256
-            analyserRef.current = analyser
-
-            const source = audioContext.createMediaStreamSource(stream)
-            source.connect(analyser)
-
-            const recorder = new MediaRecorder(stream)
-            mediaRecorderRef.current = recorder
-            let chunks: Blob[] = []
-            let speechDetected = false
-
-            recorder.ondataavailable = (e) => {
-                if (e.data.size > 0) chunks.push(e.data)
-            }
-
-            recorder.onstop = async () => {
-                if (speechDetected && chunks.length > 0) {
-                    const audioBlob = new Blob(chunks, { type: 'audio/webm' })
-                    await processAudio(audioBlob)
-                }
-                chunks = []
-                speechDetected = false
-                if (interviewMode && streamRef.current) {
-                    recorder.start()
-                }
-            }
-
-            recorder.start()
-            setIsRecording(true)
-
-            const bufferLength = analyser.frequencyBinCount
-            const dataArray = new Uint8Array(bufferLength)
-            let lastInteraction = Date.now()
-            const SILENCE_THRESHOLD = 35
-            const SILENCE_DURATION = 2000
-
-            const checkVolume = () => {
-                if (!analyserRef.current || !interviewMode) return
-
-                analyser.getByteFrequencyData(dataArray)
-                const volume = dataArray.reduce((a, b) => a + b) / bufferLength
-
-                if (volume > SILENCE_THRESHOLD) {
-                    lastInteraction = Date.now()
-                    speechDetected = true
-                } else {
-                    if (Date.now() - lastInteraction > SILENCE_DURATION && recorder.state === 'recording') {
-                        recorder.stop()
-                        lastInteraction = Date.now()
-                    }
-                }
-
-                if (interviewMode) {
-                    requestAnimationFrame(checkVolume)
-                }
-            }
-
-            checkVolume()
-        } catch (error) {
-            console.error('[RENDERER] Interview mode failed:', error)
-            setInterviewMode(false)
-        }
-    }
-
-    const stopContinuousListening = () => {
-        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
-            mediaRecorderRef.current.stop()
-        }
-        streamRef.current?.getTracks().forEach(track => track.stop())
-        streamRef.current = null
-        audioContextRef.current?.close()
-        audioContextRef.current = null
-        analyserRef.current = null
-        setIsRecording(false)
-    }
-
-    useEffect(() => {
-        const ipc = (window as any).ipcRenderer
-        if (ipc) {
-            console.log('[RENDERER] IPC Bridge connected')
-        }
-    }, [])
-
-    useEffect(() => {
-        const ipc = (window as any).ipcRenderer
+        const ipc = getIpcBridge()
         if (!ipc?.invoke) {
             return
         }
-        // Resize logic accounting for streaming state
-        const hasContent = Boolean(response) || messages.length > 0 || isStreaming
+
+        const hasContent = Boolean(response) || messages.length > 0
         const size = isCollapsed
             ? { width: COLLAPSED_WIDTH, height: COLLAPSED_HEIGHT }
             : {
                 width: EXPANDED_WIDTH,
                 height: hasContent ? RESPONSE_HEIGHT : showSettings ? SETTINGS_HEIGHT : COLLAPSED_HEIGHT,
             }
+
         ipc.invoke('resize-window', size).catch((error: unknown) => {
             console.warn('[RENDERER] Window resize failed:', error)
         })
-    }, [response, messages.length, showSettings, isCollapsed, isStreaming])
+    }, [response, messages.length, showSettings, isCollapsed])
 
+    // Enable focus when settings is open or stealth mode is off
     useEffect(() => {
-        const ipc = (window as any).ipcRenderer
+        const ipc = getIpcBridge()
         if (!ipc?.invoke) {
             return
         }
-        const shouldBeClickable = true
-        ipc.invoke('set-focusable', { focusable: shouldBeClickable }).catch((error: unknown) => {
-            console.warn('[RENDERER] Interaction toggle failed:', error)
+
+        // Focusable when: settings is open OR stealth mode is disabled
+        const shouldBeFocusable = showSettings || !stealthMode
+        ipc.invoke('set-focusable', { focusable: shouldBeFocusable }).catch((error: unknown) => {
+            console.warn('[RENDERER] Focus toggle failed:', error)
         })
-    }, [showSettings, isCollapsed])
+    }, [showSettings, stealthMode])
+
+    const runAISolve = async (request: SolveRequest) => {
+        const ipc = getIpcBridge()
+        if (!ipc?.invoke) {
+            throw new Error('IPC Bridge not found.')
+        }
+
+        const result = await ipc.invoke('solve-with-ai', request)
+        if (typeof result !== 'string' || !result.trim()) {
+            throw new Error('AI returned an empty response')
+        }
+
+        return result.trim()
+    }
+
+    const getApiKey = (): string | undefined => {
+        switch (provider) {
+            case 'gemini':
+                return geminiApiKey || undefined
+            case 'kimi':
+                return kimiApiKey || undefined
+            default:
+                return undefined
+        }
+    }
 
     const handleCapture = async () => {
-        const ipc = (window as any).ipcRenderer
-        if (!ipc) {
+        const ipc = getIpcBridge()
+        if (!ipc?.invoke) {
             setResponse('Error: IPC Bridge not found.')
             return
         }
 
-        if (!apiKey || !modelName.trim()) {
-            setShowSettings(true)
-            return
-        }
+        const selectedModel = getSelectedModel()
 
         setLoading(true)
         setResponse(null)
@@ -363,62 +290,39 @@ Also, provide 3 short logical follow-up actions (max 6 words each) at the end, e
         setMessages([])
         setFollowUp('')
         setFollowUpImage(null)
-        chatSessionRef.current = null
 
         try {
-            const captureData = await ipc.invoke('capture-screen')
-            if (!captureData) {
-                throw new Error('No image data received from capture-screen')
+            // Kimi Code doesn't support images, skip screen capture and use text-only
+            let captureData: string | undefined
+            if (provider !== 'kimi-code') {
+                captureData = await ipc.invoke('capture-screen') as string
+                if (typeof captureData !== 'string' || !captureData) {
+                    throw new Error('No image data received from capture-screen')
+                }
             }
-            const base64Image = captureData.includes(',') ? captureData.split(',')[1] : captureData
 
-            const selectedModel = modelName.trim() || DEFAULT_MODEL
-            const genAI = new GoogleGenerativeAI(apiKey)
-            const model = genAI.getGenerativeModel({ model: selectedModel })
+            const fullText = await runAISolve({
+                provider,
+                model: selectedModel,
+                apiKey: getApiKey(),
+                prompt: buildQuickSolvePrompt(sessionContext),
+                imageBase64: captureData,
+                imageMimeType: captureData ? 'image/png' : undefined,
+                ghostMode,
+            })
 
-            const systemPrompt = `You are a professional on-screen coding assistant. 
-1. Analyze the provided image.
-2. If you see code, a technical problem, or a question, solve it concisely.
-3. Provide ONLY the solution (code or answer). No conversational filler.
-4. If multiple tasks exist, solve the most visible one.`
-
-            const result = await model.generateContent([
-                {
-                    inlineData: {
-                        data: base64Image,
-                        mimeType: "image/png"
-                    }
-                },
-                systemPrompt,
-            ])
-
-            const text = result.response.text()
-            if (!text || text.trim() === '') {
-                setResponse('Gemini didn\'t find anything to solve on the screen.')
-            } else {
-                const cleanText = text.trim()
-                setMessages([{ role: 'assistant', text: cleanText }])
-                chatSessionRef.current = model.startChat({
-                    history: [
-                        {
-                            role: 'user',
-                            parts: [
-                                {
-                                    inlineData: {
-                                        data: base64Image,
-                                        mimeType: 'image/png',
-                                    },
-                                },
-                                { text: systemPrompt },
-                            ],
-                        },
-                        { role: 'model', parts: [{ text: cleanText }] },
-                    ],
-                })
+            const { cleanText, suggestions } = processResponse(fullText)
+            if (!cleanText) {
+                setResponse('AI did not return a usable answer.')
+                setRecommendations([])
+                return
             }
+
+            setMessages([{ role: 'assistant', text: cleanText }])
+            setRecommendations(suggestions)
         } catch (error) {
-            console.error('[RENDERER] Error in handleCapture:', error)
             const message = error instanceof Error ? error.message : String(error)
+            console.error('[RENDERER] Error in handleCapture:', message)
 
             if (/Screen capture returned an empty image|Screen Recording/i.test(message)) {
                 setNeedsScreenPermission(true)
@@ -432,16 +336,13 @@ Also, provide 3 short logical follow-up actions (max 6 words each) at the end, e
     }
 
     const handleDeepAnalysis = async () => {
-        const ipc = (window as any).ipcRenderer
-        if (!ipc) {
+        const ipc = getIpcBridge()
+        if (!ipc?.invoke) {
             setResponse('Error: IPC Bridge not found.')
             return
         }
 
-        if (!apiKey || !modelName.trim()) {
-            setShowSettings(true)
-            return
-        }
+        const selectedModel = getSelectedModel()
 
         setAnalyzingDeep(true)
         setResponse(null)
@@ -449,76 +350,39 @@ Also, provide 3 short logical follow-up actions (max 6 words each) at the end, e
         setMessages([])
         setFollowUp('')
         setFollowUpImage(null)
-        chatSessionRef.current = null
 
         try {
             const captureData = await ipc.invoke('capture-screen')
             const structure = await ipc.invoke('analyze-screen-deep')
 
-            if (!captureData) {
+            if (typeof captureData !== 'string' || !captureData) {
                 throw new Error('No image data received from capture-screen')
             }
-            const base64Image = captureData.includes(',') ? captureData.split(',')[1] : captureData
 
-            const selectedModel = modelName.trim() || DEFAULT_MODEL
-            const genAI = new GoogleGenerativeAI(apiKey)
-            const model = genAI.getGenerativeModel({ model: selectedModel })
+            const fullText = await runAISolve({
+                provider,
+                model: selectedModel,
+                apiKey: getApiKey(),
+                prompt: buildDeepSolvePrompt(sessionContext),
+                imageBase64: captureData,
+                imageMimeType: 'image/png',
+                semanticStructure: structure,
+                ghostMode,
+            })
 
-            const systemPrompt = `You are a God-mode macOS assistant. 
-You have two sources of context:
-1. RAW PIXELS: The provided screenshot.
-2. SEMANTIC STRUCTURE: A JSON tree of UI elements (buttons, text fields, values) from the active window.
-
-CONTEXT (Semantic Structure):
-${JSON.stringify(structure, null, 2)}
-
-TASK:
-Analyze the screen and solve the user's problem. 
-BE EXTREMELY PRECISE. If you see code in a text area, use it. 
-If you see a button that should be interacted with, guide the user to it by its exact name.
-
-Provide a concise, professional solution.
-Also, provide 3 short logical follow-up actions (max 6 words each) at the end, each on a new line starting with 'Suggestion: '.`
-
-            const result = await model.generateContent([
-                {
-                    inlineData: {
-                        data: base64Image,
-                        mimeType: "image/png"
-                    }
-                },
-                systemPrompt,
-            ])
-
-            const fullText = result.response.text().trim()
-            if (!fullText) {
-                setResponse('Gemini didn\'t find anything to analyze.')
-            } else {
-                const { cleanText, suggestions } = processResponse(fullText)
-                setMessages([{ role: 'assistant', text: cleanText }])
-                setRecommendations(suggestions)
-
-                chatSessionRef.current = model.startChat({
-                    history: [
-                        {
-                            role: 'user',
-                            parts: [
-                                {
-                                    inlineData: {
-                                        data: base64Image,
-                                        mimeType: 'image/png',
-                                    },
-                                },
-                                { text: systemPrompt },
-                            ],
-                        },
-                        { role: 'model', parts: [{ text: fullText }] },
-                    ],
-                })
+            const { cleanText, suggestions } = processResponse(fullText)
+            if (!cleanText) {
+                setResponse('AI did not return a usable deep analysis.')
+                setRecommendations([])
+                return
             }
+
+            setMessages([{ role: 'assistant', text: cleanText }])
+            setRecommendations(suggestions)
         } catch (error) {
-            console.error('[RENDERER] Error in handleDeepAnalysis:', error)
-            setResponse(`Deep Analysis Error: ${error instanceof Error ? error.message : String(error)}`)
+            const message = error instanceof Error ? error.message : String(error)
+            console.error('[RENDERER] Error in handleDeepAnalysis:', message)
+            setResponse(`Deep Analysis Error: ${message}`)
         } finally {
             setAnalyzingDeep(false)
         }
@@ -536,48 +400,52 @@ Also, provide 3 short logical follow-up actions (max 6 words each) at the end, e
     const sendFollowUp = async () => {
         const trimmed = followUp.trim()
         if ((!trimmed && !followUpImage) || followUpLoading) return
-        if (!chatSessionRef.current) {
+
+        if (!messages.length) {
             setResponse('No active context. Run Quick Solve first.')
             return
         }
 
+        const selectedModel = getSelectedModel()
+        const userText = trimmed || '[Attached image for follow-up]'
+
+        const userMessage: ChatMessage = {
+            role: 'user',
+            text: userText,
+            image: followUpImage
+                ? {
+                    dataUrl: followUpImage.dataUrl,
+                    name: followUpImage.name,
+                }
+                : undefined,
+        }
+
+        const nextMessages = [...messages, userMessage]
+
         setFollowUpLoading(true)
-        setMessages((prev) => [
-            ...prev,
-            {
-                role: 'user',
-                text: trimmed,
-                image: followUpImage
-                    ? {
-                        dataUrl: followUpImage.dataUrl,
-                        name: followUpImage.name,
-                    }
-                    : undefined,
-            },
-        ])
+        setMessages(nextMessages)
         setFollowUp('')
         setFollowUpImage(null)
+        setRecommendations([])
 
         try {
-            const parts: Array<{ text?: string; inlineData?: { data: string; mimeType: string } }> = []
-            if (trimmed) parts.push({ text: trimmed })
-            if (followUpImage) {
-                parts.push({
-                    inlineData: {
-                        data: followUpImage.base64,
-                        mimeType: followUpImage.mimeType,
-                    },
-                })
-            }
+            const fullText = await runAISolve({
+                provider,
+                model: selectedModel,
+                apiKey: getApiKey(),
+                prompt: buildFollowUpPrompt(trimmed, sessionContext),
+                imageBase64: followUpImage?.base64,
+                imageMimeType: followUpImage?.mimeType,
+                messages: nextMessages.map(({ role, text }) => ({ role, text })),
+                ghostMode,
+            })
 
-            const result = await chatSessionRef.current.sendMessage(parts.length > 1 ? parts : (trimmed || parts[0]))
-            const text = result.response.text()
-            const { cleanText, suggestions } = processResponse(text)
-
-            setMessages((prev) => [...prev, { role: 'assistant', text: cleanText }])
+            const { cleanText, suggestions } = processResponse(fullText)
+            setMessages((prev) => [...prev, { role: 'assistant', text: cleanText || fullText }])
             setRecommendations(suggestions)
         } catch (error) {
-            setMessages((prev) => [...prev, { role: 'assistant', text: `Error: ${error instanceof Error ? error.message : String(error)}` }])
+            const message = error instanceof Error ? error.message : String(error)
+            setMessages((prev) => [...prev, { role: 'assistant', text: `Error: ${message}` }])
         } finally {
             setFollowUpLoading(false)
         }
@@ -592,6 +460,7 @@ Also, provide 3 short logical follow-up actions (max 6 words each) at the end, e
         reader.onload = () => {
             if (typeof reader.result !== 'string') return
             const [header, base64] = reader.result.split(',')
+            if (!base64) return
             setFollowUpImage({
                 dataUrl: reader.result,
                 base64,
@@ -632,38 +501,51 @@ Also, provide 3 short logical follow-up actions (max 6 words each) at the end, e
         })
     }
 
-    const listModels = async () => {
-        if (!apiKey) return
-        setListingModels(true)
-        try {
-            const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`)
-            const data = await res.json()
-            if (data.models) {
-                const modelIds = data.models.map((m: any) => m.name.replace('models/', ''))
-                setResponse(`Available Models:\n\n${modelIds.slice(0, 10).join('\n')}`)
-            }
-        } catch (error) {
-            setResponse(`Failed to list models.`)
-        } finally {
-            setListingModels(false)
-        }
-    }
-
     const saveSettings = (e: React.FormEvent) => {
         e.preventDefault()
-        const nextModel = modelName.trim() || DEFAULT_MODEL
-        localStorage.setItem('gemini_api_key', apiKey)
-        localStorage.setItem('gemini_model', nextModel)
-        localStorage.setItem('gemini_interview_context', interviewContext)
+        const nextModel = getSelectedModel()
+        localStorage.setItem('ai_provider', provider)
+        localStorage.setItem('ai_model', nextModel)
+        localStorage.setItem(MODEL_STORAGE_BY_PROVIDER[provider], nextModel)
+        localStorage.setItem('gemini_api_key', geminiApiKey)
+        localStorage.setItem('kimi_api_key', kimiApiKey)
+        localStorage.setItem('ghost_mode', String(ghostMode))
+        localStorage.setItem('stealth_mode', String(stealthMode))
         setShowSettings(false)
-        setMessages([])
-        chatSessionRef.current = null
+        const modeLabels = []
+        if (ghostMode) modeLabels.push('Ghost')
+        if (stealthMode) modeLabels.push('Stealth')
+        const modeText = modeLabels.length > 0 ? ` (${modeLabels.join(' + ')} ON)` : ''
+        setResponse(`Settings updated. Using ${provider.toUpperCase()} with model: ${nextModel}${modeText}`)
     }
 
     const openScreenRecordingSettings = () => {
-        const ipc = (window as any).ipcRenderer
+        const ipc = getIpcBridge()
         ipc?.invoke('open-screen-capture-settings')
     }
+
+    const getProviderLabel = () => {
+        let label = 'Codex'
+        switch (provider) {
+            case 'gemini':
+                label = 'Gemini'
+                break
+            case 'kimi':
+                label = 'Kimi'
+                break
+            case 'kimi-code':
+                label = 'Kimi Code'
+                break
+        }
+        const modes = []
+        if (ghostMode) modes.push('Ghost')
+        if (stealthMode) modes.push('Stealth')
+        return modes.length > 0 ? `${label} • ${modes.join('+')}` : label
+    }
+
+    const modelPlaceholder = getDefaultModelForProvider(provider)
+    // Use modelPlaceholder to avoid TypeScript unused variable warning
+    void modelPlaceholder
 
     return (
         <div className="widget-layer flex flex-col items-stretch gap-3 pt-6 w-full px-4" aria-hidden="true">
@@ -673,19 +555,18 @@ Also, provide 3 short logical follow-up actions (max 6 words each) at the end, e
                 </div>
             ) : (
                 <>
-                    {(response || messages.length > 0 || isStreaming) && (
+                    {(response || messages.length > 0) && (
                         <div
                             className="glass no-drag w-full rounded-2xl animate-in fade-in slide-in-from-bottom-4 duration-300 overflow-hidden shadow-2xl flex flex-col"
                             style={{ maxWidth: 'min(100%, 960px)' }}
                         >
-                            {/* macOS Style Title Bar */}
                             <div className="bg-black/40 border-b border-white/5 px-4 py-2.5 flex items-center justify-between drag">
                                 <div className="flex gap-1.5 no-drag">
                                     <div className="w-3 h-3 rounded-full bg-[#ff5f57] border border-black/10" />
                                     <div className="w-3 h-3 rounded-full bg-[#febc2e] border border-black/10" />
                                     <div className="w-3 h-3 rounded-full bg-[#28c840] border border-black/10" />
                                 </div>
-                                <span className="text-[10px] font-black text-white/30 uppercase tracking-[0.2em]">Solution Insight</span>
+                                <span className="text-[10px] font-black text-white/30 uppercase tracking-[0.2em]">Solution Insight • {getProviderLabel()}</span>
                                 <div className="flex gap-2 no-drag">
                                     <button
                                         onClick={copyToClipboard}
@@ -700,9 +581,7 @@ Also, provide 3 short logical follow-up actions (max 6 words each) at the end, e
                                             setFollowUp('')
                                             setFollowUpImage(null)
                                             setNeedsScreenPermission(false)
-                                            chatSessionRef.current = null
-                                            setIsStreaming(false)
-                                            setStreamedResponse('')
+                                            setRecommendations([])
                                         }}
                                         className="text-[10px] text-white/30 hover:text-white/60 px-1 transition-colors font-bold"
                                     >
@@ -714,38 +593,54 @@ Also, provide 3 short logical follow-up actions (max 6 words each) at the end, e
                             <div className="p-4 overflow-auto max-h-[400px] w-full custom-scrollbar">
                                 <div className="space-y-4 w-full">
                                     {messages.map((msg, index) => (
-                                        <div key={index} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                                        <div key={`${msg.role}-${index}`} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
                                             <div className={`max-w-[90%] rounded-2xl px-4 py-3 border break-words ${msg.role === 'user' ? 'bg-blue-600/20 border-blue-400/20 text-white' : 'bg-white/5 border-white/10 text-white'}`}>
                                                 <span className="block text-[10px] uppercase tracking-widest text-white/50 mb-1">{msg.role === 'user' ? 'You' : 'Assistant'}</span>
                                                 {renderMessageContent(msg.text, `${msg.role}-${index}`)}
                                             </div>
                                         </div>
                                     ))}
-                                    {isStreaming && streamedResponse && (
-                                        <div className="flex justify-start">
-                                            <div className="max-w-[90%] rounded-2xl px-4 py-3 border border-white/10 bg-white/5 text-white">
-                                                <span className="block text-[10px] uppercase tracking-widest text-white/50 mb-1">AI Typing...</span>
-                                                {renderMessageContent(streamedResponse, 'streaming')}
-                                            </div>
-                                        </div>
-                                    )}
-                                    {response && !messages.length && !isStreaming && <div className="text-white text-sm whitespace-pre-wrap break-words">{response}</div>}
+                                    {response && !messages.length && <div className="text-white text-sm whitespace-pre-wrap break-words">{response}</div>}
                                 </div>
+
                                 {needsScreenPermission && (
                                     <button onClick={openScreenRecordingSettings} className="no-drag mt-3 w-full bg-blue-600/20 hover:bg-blue-600/40 text-blue-200 px-3 py-2 rounded-xl text-xs font-bold">Open Screen Recording Settings</button>
                                 )}
-                                {messages.length > 0 && !isStreaming && (
+
+                                {messages.length > 0 && (
                                     <div className="no-drag mt-4 border-t border-white/10 pt-3">
                                         <label className="block text-[10px] text-white/40 uppercase font-black mb-2">Follow-up</label>
                                         {recommendations.length > 0 && (
                                             <div className="flex flex-wrap gap-2 mb-3">
                                                 {recommendations.map((rec, i) => (
-                                                    <button key={i} onClick={() => { setFollowUp(rec); setRecommendations([]); setTimeout(() => document.getElementById('send-followup-btn')?.click(), 50) }} className="no-drag text-[9px] px-3 py-1.5 rounded-full bg-blue-600/10 border border-blue-500/20 text-blue-200 hover:bg-blue-600/20 transition-all font-bold uppercase tracking-tight">{rec}</button>
+                                                    <button
+                                                        key={`${rec}-${i}`}
+                                                        onClick={() => {
+                                                            setFollowUp(rec)
+                                                            setRecommendations([])
+                                                            setTimeout(() => document.getElementById('send-followup-btn')?.click(), 50)
+                                                        }}
+                                                        className="no-drag text-[9px] px-3 py-1.5 rounded-full bg-blue-600/10 border border-blue-500/20 text-blue-200 hover:bg-blue-600/20 transition-all font-bold uppercase tracking-tight"
+                                                    >
+                                                        {rec}
+                                                    </button>
                                                 ))}
                                             </div>
                                         )}
                                         <div className="flex gap-2 items-start">
-                                            <textarea value={followUp} onChange={(e) => setFollowUp(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendFollowUp() } }} placeholder="Ask a follow-up..." rows={2} className="no-drag bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs text-white w-full outline-none focus:border-blue-500/50 resize-none" />
+                                            <textarea
+                                                value={followUp}
+                                                onChange={(e) => setFollowUp(e.target.value)}
+                                                onKeyDown={(e) => {
+                                                    if (e.key === 'Enter' && !e.shiftKey) {
+                                                        e.preventDefault()
+                                                        sendFollowUp()
+                                                    }
+                                                }}
+                                                placeholder="Ask a follow-up..."
+                                                rows={2}
+                                                className="no-drag bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs text-white w-full outline-none focus:border-blue-500/50 resize-none"
+                                            />
                                             <div className="flex flex-col gap-2">
                                                 <button type="button" onClick={() => followUpImageInputRef.current?.click()} className="no-drag bg-white/10 hover:bg-white/20 text-white/80 p-2 rounded-xl transition-all hover:scale-105 active:scale-95"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2" /><circle cx="9" cy="9" r="2" /><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21" /></svg></button>
                                                 <button id="send-followup-btn" type="button" onClick={sendFollowUp} disabled={followUpLoading || (!followUp.trim() && !followUpImage)} className="no-drag bg-blue-600/20 hover:bg-blue-600/40 disabled:opacity-50 text-blue-200 p-2 rounded-xl ">{followUpLoading ? <div className="w-4 h-4 border-2 border-blue-200/30 border-t-blue-200 rounded-full animate-spin" /> : <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m22 2-7 20-4-9-9-4Z" /><path d="M22 2 11 13" /></svg>}</button>
@@ -771,17 +666,13 @@ Also, provide 3 short logical follow-up actions (max 6 words each) at the end, e
                     >
                         <div className="flex items-center gap-3">
                             <div className={`w-3 h-3 rounded-full transition-all duration-300 relative ${loading || analyzingDeep ? 'bg-yellow-400' : 'bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.6)]'}`}>
-                                {(loading || analyzingDeep || !loading) && (
-                                    <div className={`absolute inset-0 rounded-full animate-ping ${loading || analyzingDeep ? 'bg-yellow-400/40' : 'bg-green-500/40'}`} />
-                                )}
+                                <div className={`absolute inset-0 rounded-full animate-ping ${loading || analyzingDeep ? 'bg-yellow-400/40' : 'bg-green-500/40'}`} />
                             </div>
-                            <span className="text-white font-medium text-sm tracking-tight">{loading || analyzingDeep ? 'Analyzing...' : 'Online'}</span>
+                            <span className="text-white font-medium text-sm tracking-tight">{loading || analyzingDeep ? 'Analyzing...' : `${getProviderLabel()} Online`}</span>
                         </div>
                         <div className="w-[1px] h-6 bg-white/10" />
-                        <button onClick={handleCapture} disabled={loading || analyzingDeep || isRecording} className="no-drag bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 text-white px-5 py-2 rounded-full text-xs font-bold transition-all shadow-lg active:translate-y-0.5">Quick Solve</button>
-                        <button onClick={handleDeepAnalysis} disabled={loading || analyzingDeep || isRecording} className={`no-drag px-5 py-2 rounded-full text-xs font-bold transition-all border ${analyzingDeep ? 'bg-indigo-600/20 border-indigo-500/50 text-indigo-200' : 'bg-transparent border-white/20 hover:border-white/40 text-white/80'}`}>{analyzingDeep ? 'Analyzing...' : 'Deep Analysis'}</button>
-                        <button onClick={toggleRecording} disabled={loading || analyzingDeep || interviewMode} className={`no-drag px-5 py-2 rounded-full text-xs font-bold transition-all flex items-center gap-2 ${isRecording ? 'bg-red-600 text-white animate-pulse' : 'bg-white/10 hover:bg-white/20 text-white/90'}`}><div className={`w-2 h-2 rounded-full ${isRecording ? 'bg-white' : 'bg-red-500'}`} />{isRecording ? 'Stop' : 'Record'}</button>
-                        <button onClick={() => setInterviewMode(!interviewMode)} disabled={loading || analyzingDeep || isRecording} className={`no-drag px-5 py-2 rounded-full text-xs font-bold transition-all flex items-center gap-2 ${interviewMode ? 'bg-emerald-600 text-white animate-pulse shadow-[0_0_15px_rgba(16,185,129,0.4)]' : 'bg-white/10 hover:bg-white/20 text-white/90'}`}><div className={`w-2 h-2 rounded-full ${interviewMode ? 'bg-white' : 'bg-emerald-500'}`} />{interviewMode ? 'Stop Interview' : 'Interview'}</button>
+                        <button onClick={handleCapture} disabled={loading || analyzingDeep || followUpLoading} className="no-drag bg-blue-600 hover:bg-blue-500 disabled:bg-gray-800 text-white px-5 py-2 rounded-full text-xs font-bold transition-all shadow-lg active:translate-y-0.5">{provider === 'kimi-code' ? 'Solve Text' : 'Quick Solve'}</button>
+                        <button onClick={handleDeepAnalysis} disabled={loading || analyzingDeep || followUpLoading} className={`no-drag px-5 py-2 rounded-full text-xs font-bold transition-all border ${analyzingDeep ? 'bg-indigo-600/20 border-indigo-500/50 text-indigo-200' : 'bg-transparent border-white/20 hover:border-white/40 text-white/80'}`}>{analyzingDeep ? 'Analyzing...' : 'Deep Analysis'}</button>
                         <button onClick={() => setShowSettings(!showSettings)} className="no-drag text-white/40 hover:text-white/100 transition-colors"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l-.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.1a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" /><circle cx="12" cy="12" r="3" /></svg></button>
                         <button onClick={() => { setShowSettings(false); setIsCollapsed(true) }} className="no-drag text-white/40 hover:text-white/100 transition-colors text-xs">Hide</button>
                     </div>
@@ -789,9 +680,8 @@ Also, provide 3 short logical follow-up actions (max 6 words each) at the end, e
                     {showSettings && (
                         <div
                             className="glass no-drag mt-4 rounded-2xl w-full animate-in fade-in zoom-in-95 duration-200 shadow-2xl overflow-hidden flex flex-col border border-white/10"
-                            style={{ maxWidth: 'min(100%, 360px)' }}
+                            style={{ maxWidth: 'min(100%, 420px)' }}
                         >
-                            {/* macOS Style Title Bar for Settings */}
                             <div className="bg-black/40 border-b border-white/5 px-4 py-2 flex items-center justify-between drag">
                                 <div className="flex gap-1.5 no-drag">
                                     <div className="w-3 h-3 rounded-full bg-[#ff5f57] border border-black/10" />
@@ -804,39 +694,198 @@ Also, provide 3 short logical follow-up actions (max 6 words each) at the end, e
 
                             <div className="px-2 py-3 overflow-y-auto max-h-[62vh]">
                                 <form onSubmit={saveSettings} className="space-y-4">
+                                    {/* Provider Selector */}
                                     <div className="space-y-2">
-                                        <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Gemini API Key</label>
-                                        <div className="flex gap-2">
-                                            <input type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="Paste API key..." ref={apiKeyInputRef} className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-sm text-white w-full outline-none focus:border-blue-500/50" />
-                                            <button type="submit" className="no-drag bg-blue-600/30 hover:bg-blue-600/50 text-blue-200 px-3 py-2 rounded-xl text-xs font-bold transition-colors">Save</button>
+                                        <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">AI Provider</label>
+                                        <div className="grid grid-cols-4 gap-2">
+                                            <button
+                                                type="button"
+                                                onClick={() => setProvider('codex')}
+                                                className={`no-drag px-2 py-2 rounded-xl text-xs font-bold transition-all ${
+                                                    provider === 'codex'
+                                                        ? 'bg-blue-600 text-white'
+                                                        : 'bg-white/5 text-white/60 hover:bg-white/10'
+                                                }`}
+                                            >
+                                                Codex
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => setProvider('gemini')}
+                                                className={`no-drag px-2 py-2 rounded-xl text-xs font-bold transition-all ${
+                                                    provider === 'gemini'
+                                                        ? 'bg-blue-600 text-white'
+                                                        : 'bg-white/5 text-white/60 hover:bg-white/10'
+                                                }`}
+                                            >
+                                                Gemini
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => setProvider('kimi')}
+                                                className={`no-drag px-2 py-2 rounded-xl text-xs font-bold transition-all ${
+                                                    provider === 'kimi'
+                                                        ? 'bg-blue-600 text-white'
+                                                        : 'bg-white/5 text-white/60 hover:bg-white/10'
+                                                }`}
+                                            >
+                                                Kimi
+                                            </button>
+                                            <button
+                                                type="button"
+                                                onClick={() => setProvider('kimi-code')}
+                                                className={`no-drag px-2 py-2 rounded-xl text-xs font-bold transition-all ${
+                                                    provider === 'kimi-code'
+                                                        ? 'bg-purple-600 text-white'
+                                                        : 'bg-white/5 text-white/60 hover:bg-white/10'
+                                                }`}
+                                            >
+                                                Kimi Code
+                                            </button>
                                         </div>
                                     </div>
-                                <div className="space-y-2">
-                                    <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Gemini Model</label>
-                                    <input type="text" value={modelName} onChange={(e) => setModelName(e.target.value)} placeholder={DEFAULT_MODEL} className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-sm text-white w-full outline-none focus:border-blue-500/50" />
-                                    <div className="flex flex-wrap gap-1">
-                                        {['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-2.0-flash-exp'].map((m) => (
-                                            <button key={m} type="button" onClick={() => setModelName(m)} className="text-[9px] bg-white/5 hover:bg-white/10 text-white/50 hover:text-white px-2 py-1 rounded-full transition-colors">{m}</button>
-                                        ))}
+
+                                    {/* Ghost Mode Toggle */}
+                                    <div className="space-y-2">
+                                        <div className="flex items-center justify-between">
+                                            <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Ghost Mode</label>
+                                            <button
+                                                type="button"
+                                                onClick={() => setGhostMode(!ghostMode)}
+                                                className={`no-drag relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                                                    ghostMode ? 'bg-blue-600' : 'bg-white/10'
+                                                }`}
+                                            >
+                                                <span
+                                                    className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
+                                                        ghostMode ? 'translate-x-5' : 'translate-x-1'
+                                                    }`}
+                                                />
+                                            </button>
+                                        </div>
+                                        <p className="text-[9px] text-white/30">
+                                            {ghostMode 
+                                                ? 'Automatically reads selected text without Cmd+C' 
+                                                : 'Turn on to auto-capture selected text on solve'}
+                                        </p>
                                     </div>
-                                </div>
-                                <div className="space-y-2">
-                                    <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Interview Context</label>
-                                    <textarea
-                                        value={interviewContext}
-                                        onChange={(e) => setInterviewContext(e.target.value)}
-                                        placeholder="Paste job description or resume here..."
-                                        rows={3}
-                                        className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-xs text-white w-full outline-none focus:border-blue-500/50 resize-none"
-                                    />
-                                    <p className="text-[9px] text-white/30 italic">Context helps AI tailor answers to your specific interview.</p>
-                                </div>
-                                <button type="button" onClick={listModels} disabled={listingModels} className="no-drag w-full bg-white/5 hover:bg-white/10 disabled:opacity-50 text-white/70 py-2 rounded-xl text-[10px] font-bold uppercase tracking-wider">{listingModels ? 'Listing...' : 'List Available Models'}</button>
-                                <p className="text-[10px] text-white/20 italic text-center">API key and context are saved locally.</p>
-                            </form>
+
+                                    {/* Stealth Mode Toggle */}
+                                    <div className="space-y-2">
+                                        <div className="flex items-center justify-between">
+                                            <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Stealth Mode</label>
+                                            <button
+                                                type="button"
+                                                onClick={() => setStealthMode(!stealthMode)}
+                                                className={`no-drag relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                                                    stealthMode ? 'bg-purple-600' : 'bg-white/10'
+                                                }`}
+                                            >
+                                                <span
+                                                    className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
+                                                        stealthMode ? 'translate-x-5' : 'translate-x-1'
+                                                    }`}
+                                                />
+                                            </button>
+                                        </div>
+                                        <p className="text-[9px] text-white/30">
+                                            {stealthMode 
+                                                ? 'Widget stays invisible to other apps (disables typing)' 
+                                                : 'Turn OFF to enable typing in settings'}
+                                        </p>
+                                        {!stealthMode && (
+                                            <p className="text-[9px] text-yellow-400/70">
+                                                ⚠️ Other apps may detect widget focus
+                                            </p>
+                                        )}
+                                    </div>
+
+                                    {/* Model Input */}
+                                    <div className="space-y-2">
+                                        <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Model</label>
+                                        <input 
+                                            type="text" 
+                                            value={modelName} 
+                                            onChange={(e) => setModelName(e.target.value)} 
+                                            placeholder={modelPlaceholder} 
+                                            className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-sm text-white w-full outline-none focus:border-blue-500/50" 
+                                        />
+                                        <p className="text-[9px] text-white/30">
+                                            {provider === 'codex' && 'Default: gpt-5'}
+                                            {provider === 'gemini' && 'Default: gemini-2.0-flash'}
+                                            {(provider === 'kimi' || provider === 'kimi-code') && 'Default: kimi-k2.5'}
+                                        </p>
+                                    </div>
+
+                                    {/* API Key Inputs - Show based on provider */}
+                                    {provider === 'gemini' && (
+                                        <div className="space-y-2">
+                                            <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Gemini API Key</label>
+                                            <input 
+                                                type="password" 
+                                                value={geminiApiKey} 
+                                                onChange={(e) => setGeminiApiKey(e.target.value)} 
+                                                placeholder="Enter your Gemini API key..."
+                                                className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-sm text-white w-full outline-none focus:border-blue-500/50" 
+                                            />
+                                            <p className="text-[9px] text-white/30">Get your key from <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline">Google AI Studio</a></p>
+                                        </div>
+                                    )}
+
+                                    {provider === 'kimi' && (
+                                        <div className="space-y-2">
+                                            <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Kimi API Key</label>
+                                            <input 
+                                                type="password" 
+                                                value={kimiApiKey} 
+                                                onChange={(e) => setKimiApiKey(e.target.value)} 
+                                                placeholder="Enter your Kimi API key..."
+                                                className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-sm text-white w-full outline-none focus:border-blue-500/50" 
+                                            />
+                                            <p className="text-[9px] text-white/30">Get your key from <a href="https://platform.moonshot.cn/console/api-keys" target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:underline">Kimi Platform</a></p>
+                                        </div>
+                                    )}
+
+                                    {provider === 'kimi-code' && (
+                                        <div className="space-y-2">
+                                            <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Kimi Code CLI</label>
+                                            <div className="bg-purple-500/10 border border-purple-500/20 rounded-xl px-3 py-2">
+                                                <p className="text-xs text-white/70">Uses your Kimi Code CLI authentication.</p>
+                                                <p className="text-[9px] text-white/40 mt-1">Run <code className="bg-black/30 px-1 rounded">kimi /login</code> in terminal to authenticate.</p>
+                                            </div>
+                                            <div className="bg-blue-500/10 border border-blue-500/20 rounded-xl px-3 py-2">
+                                                <p className="text-xs text-blue-200">📋 Uses Ghost Mode: Automatically captures selected text instead of screenshots.</p>
+                                            </div>
+                                            <p className="text-[9px] text-white/30">Install with: <code className="text-purple-300">uv tool install kimi-cli</code></p>
+                                        </div>
+                                    )}
+
+                                    <div className="space-y-2">
+                                        <label className="block text-[10px] text-white/50 uppercase font-black tracking-widest">Session Context</label>
+                                        <textarea
+                                            value={sessionContext}
+                                            onChange={(e) => setSessionContext(e.target.value)}
+                                            placeholder="Optional context for this session..."
+                                            rows={3}
+                                            className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-xs text-white w-full outline-none focus:border-blue-500/50 resize-none"
+                                        />
+                                        <p className="text-[9px] text-white/30 italic">Session context stays in memory only (not persisted).</p>
+                                    </div>
+
+                                    {provider === 'codex' && (
+                                        <p className="text-[10px] text-white/25 italic text-center">Run `codex login` in your terminal before using the assistant.</p>
+                                    )}
+
+                                    <button 
+                                        type="submit" 
+                                        className="no-drag w-full bg-blue-600/30 hover:bg-blue-600/50 text-blue-200 px-4 py-2.5 rounded-xl text-xs font-bold transition-colors"
+                                    >
+                                        Save Settings
+                                    </button>
+                                </form>
+                            </div>
                         </div>
-                    </div>
-                )}
+                    )}
                 </>
             )}
         </div>
