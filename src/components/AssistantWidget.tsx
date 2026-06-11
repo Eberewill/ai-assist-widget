@@ -5,7 +5,7 @@ const SETTINGS_HEIGHT = 520
 const RESPONSE_HEIGHT = 560
 const COLLAPSED_WIDTH = 120
 const EXPANDED_WIDTH = 960
-const DEFAULT_MODEL = 'gpt-5'
+const DEFAULT_MODEL = ''
 const DEFAULT_GEMINI_MODEL = 'gemini-2.0-flash'
 const DEFAULT_KIMI_MODEL = 'kimi-k2.5'
 
@@ -53,6 +53,26 @@ function getDefaultModelForProvider(provider: AIProvider) {
         default:
             return DEFAULT_MODEL
     }
+}
+
+function isLegacyUnsupportedCodexModel(model: string) {
+    return model.trim().toLowerCase() === 'gpt-5'
+}
+
+function sanitizeStoredModel(provider: AIProvider, model: string) {
+    const trimmed = model.trim()
+    if (!trimmed) return ''
+    if (provider === 'codex' && isLegacyUnsupportedCodexModel(trimmed)) {
+        return ''
+    }
+    return trimmed
+}
+
+function getModelPlaceholder(provider: AIProvider) {
+    if (provider === 'codex') {
+        return 'Leave blank to use Codex default'
+    }
+    return getDefaultModelForProvider(provider)
 }
 
 function isModelCompatibleWithProvider(provider: AIProvider, model: string) {
@@ -187,12 +207,15 @@ const AssistantWidget: React.FC = () => {
     })
     const [modelName, setModelName] = useState(() => {
         const initialProvider = (localStorage.getItem('ai_provider') as AIProvider) || 'codex'
-        const providerSpecificModel = localStorage.getItem(MODEL_STORAGE_BY_PROVIDER[initialProvider])?.trim()
+        const providerSpecificModel = sanitizeStoredModel(
+            initialProvider,
+            localStorage.getItem(MODEL_STORAGE_BY_PROVIDER[initialProvider]) || '',
+        )
         if (providerSpecificModel) {
             return providerSpecificModel
         }
 
-        const legacyModel = localStorage.getItem('ai_model')?.trim() || ''
+        const legacyModel = sanitizeStoredModel(initialProvider, localStorage.getItem('ai_model') || '')
         if (legacyModel && isModelCompatibleWithProvider(initialProvider, legacyModel)) {
             return legacyModel
         }
@@ -207,7 +230,7 @@ const AssistantWidget: React.FC = () => {
     const followUpImageInputRef = useRef<HTMLInputElement | null>(null)
 
     useEffect(() => {
-        const providerSpecificModel = localStorage.getItem(MODEL_STORAGE_BY_PROVIDER[provider])?.trim()
+        const providerSpecificModel = sanitizeStoredModel(provider, localStorage.getItem(MODEL_STORAGE_BY_PROVIDER[provider]) || '')
         if (providerSpecificModel) {
             setModelName(providerSpecificModel)
             return
@@ -504,9 +527,15 @@ const AssistantWidget: React.FC = () => {
     const saveSettings = (e: React.FormEvent) => {
         e.preventDefault()
         const nextModel = getSelectedModel()
+        const nextModelLabel = nextModel || 'Codex default'
         localStorage.setItem('ai_provider', provider)
-        localStorage.setItem('ai_model', nextModel)
-        localStorage.setItem(MODEL_STORAGE_BY_PROVIDER[provider], nextModel)
+        if (nextModel) {
+            localStorage.setItem('ai_model', nextModel)
+            localStorage.setItem(MODEL_STORAGE_BY_PROVIDER[provider], nextModel)
+        } else {
+            localStorage.removeItem('ai_model')
+            localStorage.removeItem(MODEL_STORAGE_BY_PROVIDER[provider])
+        }
         localStorage.setItem('gemini_api_key', geminiApiKey)
         localStorage.setItem('kimi_api_key', kimiApiKey)
         localStorage.setItem('ghost_mode', String(ghostMode))
@@ -516,7 +545,7 @@ const AssistantWidget: React.FC = () => {
         if (ghostMode) modeLabels.push('Ghost')
         if (stealthMode) modeLabels.push('Stealth')
         const modeText = modeLabels.length > 0 ? ` (${modeLabels.join(' + ')} ON)` : ''
-        setResponse(`Settings updated. Using ${provider.toUpperCase()} with model: ${nextModel}${modeText}`)
+        setResponse(`Settings updated. Using ${provider.toUpperCase()} with model: ${nextModelLabel}${modeText}`)
     }
 
     const openScreenRecordingSettings = () => {
@@ -543,9 +572,7 @@ const AssistantWidget: React.FC = () => {
         return modes.length > 0 ? `${label} • ${modes.join('+')}` : label
     }
 
-    const modelPlaceholder = getDefaultModelForProvider(provider)
-    // Use modelPlaceholder to avoid TypeScript unused variable warning
-    void modelPlaceholder
+    const modelPlaceholder = getModelPlaceholder(provider)
 
     return (
         <div className="widget-layer flex flex-col items-stretch gap-3 pt-6 w-full px-4" aria-hidden="true">
@@ -811,7 +838,7 @@ const AssistantWidget: React.FC = () => {
                                             className="no-drag bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-sm text-white w-full outline-none focus:border-blue-500/50" 
                                         />
                                         <p className="text-[9px] text-white/30">
-                                            {provider === 'codex' && 'Default: gpt-5'}
+                                            {provider === 'codex' && 'Default: Codex account default'}
                                             {provider === 'gemini' && 'Default: gemini-2.0-flash'}
                                             {(provider === 'kimi' || provider === 'kimi-code') && 'Default: kimi-k2.5'}
                                         </p>

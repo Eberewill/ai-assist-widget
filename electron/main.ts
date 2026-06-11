@@ -20,7 +20,6 @@ const WINDOW_BOTTOM_MARGIN = 20
 const CAPTURE_HIDE_DELAY_MS = 300
 const DEBUG_CAPTURE_ENV = 'ASSISTANT_DEBUG_CAPTURES'
 const DEBUG_CAPTURE_DIR = 'debug_captures'
-const CODEX_DEFAULT_MODEL = 'gpt-5'
 const GEMINI_DEFAULT_MODEL = 'gemini-2.0-flash'
 const KIMI_DEFAULT_MODEL = 'kimi-k2.5'
 const MAX_HISTORY_MESSAGES = 10
@@ -335,16 +334,37 @@ function normalizeBase64(raw: string) {
 function resolveCodexModel(requestedModel?: string) {
     const trimmed = requestedModel?.trim()
     if (!trimmed) {
-        return CODEX_DEFAULT_MODEL
+        return null
     }
 
     const normalized = trimmed.toLowerCase()
     if (normalized.startsWith('gemini') || normalized.startsWith('kimi')) {
-        console.warn(`[MAIN] Ignoring incompatible Codex model "${trimmed}". Falling back to ${CODEX_DEFAULT_MODEL}.`)
-        return CODEX_DEFAULT_MODEL
+        console.warn(`[MAIN] Ignoring incompatible Codex model "${trimmed}". Falling back to Codex default.`)
+        return null
     }
 
     return trimmed
+}
+
+function isUnsupportedCodexModelError(error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    return /model is not supported when using Codex/i.test(message)
+}
+
+function createIsolatedCodexHome(tempDir: string) {
+    const isolatedHome = path.join(tempDir, 'codex-home')
+    const isolatedCodexDir = path.join(isolatedHome, '.codex')
+    const sourceCodexDir = path.join(os.homedir(), '.codex')
+    const sourceAuthPath = path.join(sourceCodexDir, 'auth.json')
+    const targetAuthPath = path.join(isolatedCodexDir, 'auth.json')
+
+    fs.mkdirSync(isolatedCodexDir, { recursive: true })
+
+    if (fs.existsSync(sourceAuthPath)) {
+        fs.copyFileSync(sourceAuthPath, targetAuthPath)
+    }
+
+    return isolatedHome
 }
 
 function truncateForPrompt(value: string, maxLength: number) {
@@ -408,14 +428,14 @@ type CodexCommandResult = {
     stderr: string
 }
 
-function runCodexCommand(codexCommand: string, args: string[]) {
+function runCodexCommand(codexCommand: string, args: string[], envOverrides: NodeJS.ProcessEnv = {}) {
     return new Promise<CodexCommandResult>((resolve, reject) => {
         execFile(
             codexCommand,
             args,
             {
                 cwd: process.cwd(),
-                env: process.env,
+                env: { ...process.env, ...envOverrides },
                 timeout: 120000,
                 maxBuffer: 20 * 1024 * 1024,
             },
@@ -437,12 +457,12 @@ function runCodexCommand(codexCommand: string, args: string[]) {
     })
 }
 
-async function runCodexWithFallback(args: string[]) {
+async function runCodexWithFallback(args: string[], envOverrides: NodeJS.ProcessEnv = {}) {
     let lastError: Error | null = null
 
     for (const codexCommand of CODEX_COMMAND_CANDIDATES) {
         try {
-            return await runCodexCommand(codexCommand, args)
+            return await runCodexCommand(codexCommand, args, envOverrides)
         } catch (error) {
             const candidateError = error as NodeJS.ErrnoException
             if (candidateError.code === 'ENOENT') {
@@ -462,6 +482,7 @@ async function solveWithCodex(request: SolveRequest) {
 
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-assist-codex-'))
     const outputPath = path.join(tempDir, 'last-message.txt')
+    const isolatedHome = createIsolatedCodexHome(tempDir)
 
     let imagePath: string | null = null
 
@@ -482,30 +503,41 @@ async function solveWithCodex(request: SolveRequest) {
             fs.writeFileSync(imagePath, imageBuffer)
         }
 
-        const args = [
-            'exec',
-            '-c',
-            'model_reasoning_effort="high"',
-            '-c',
-            'experimental_use_rmcp_client=false',
-            '-c',
-            'mcp_servers={}',
-            '--skip-git-repo-check',
-            '--color',
-            'never',
-            '--output-last-message',
-            outputPath,
-            '--model',
-            model,
-        ]
+        const buildArgs = (selectedModel: string | null) => {
+            const args = [
+                'exec',
+                '--ephemeral',
+                '-c',
+                'model_reasoning_effort="high"',
+                '--skip-git-repo-check',
+                '--color',
+                'never',
+                '--output-last-message',
+                outputPath,
+            ]
 
-        if (imagePath) {
-            args.push('--image', imagePath)
+            if (selectedModel) {
+                args.push('--model', selectedModel)
+            }
+
+            if (imagePath) {
+                args.push('--image', imagePath)
+            }
+
+            args.push('--', prompt)
+            return args
         }
 
-        args.push('--', prompt)
-
-        const commandResult = await runCodexWithFallback(args)
+        let commandResult: CodexCommandResult
+        try {
+            commandResult = await runCodexWithFallback(buildArgs(model), { HOME: isolatedHome })
+        } catch (error) {
+            if (!model || !isUnsupportedCodexModelError(error)) {
+                throw error
+            }
+            console.warn(`[MAIN] Codex rejected model "${model}". Retrying with Codex default.`)
+            commandResult = await runCodexWithFallback(buildArgs(null), { HOME: isolatedHome })
+        }
 
         const fileResponse = fs.existsSync(outputPath) ? fs.readFileSync(outputPath, 'utf8').trim() : ''
         const stdoutResponse = commandResult.stdout.trim()
