@@ -448,6 +448,20 @@ function runCodexCommand(codexCommand: string, args: string[], envOverrides: Nod
                         reject(err)
                         return
                     }
+                    const execError = error as Error & { killed?: boolean; signal?: NodeJS.Signals | null; code?: number | string | null }
+                    if (execError.killed && execError.signal === 'SIGTERM') {
+                        reject(new Error('Codex CLI timed out after 120s.'))
+                        return
+                    }
+                    if (!stderrText.trim() && (execError.signal || execError.code === 137)) {
+                        reject(
+                            new Error(
+                                `Codex CLI was killed (${execError.signal || 'exit 137'}) before producing output. ` +
+                                    'Your Codex install is likely outdated or broken; run `npm i -g @openai/codex@latest` and check `codex --version`.',
+                            ),
+                        )
+                        return
+                    }
                     reject(new Error(stderrText.trim() || error.message))
                     return
                 }
